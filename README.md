@@ -1,4 +1,4 @@
-# MCP Bridge Aggregator
+# BridgeKitty 🐱
 
 Cross-chain bridge aggregation for AI agents. One MCP server, all bridges, best routes.
 
@@ -17,7 +17,7 @@ Queries multiple bridge protocols in parallel (LI.FI covering 59+ chains and 27+
 ## Install
 
 ```bash
-git clone <repo-url> && cd mcp-bridge-aggregator
+git clone <repo-url> && cd bridgekitty
 npm install
 npm run build
 ```
@@ -31,9 +31,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "bridge-aggregator": {
+    "bridgekitty": {
       "command": "node",
-      "args": ["/absolute/path/to/mcp-bridge-aggregator/dist/index.js"]
+      "args": ["/absolute/path/to/bridgekitty/dist/index.js"]
     }
   }
 }
@@ -46,9 +46,9 @@ Add to your MCP server config:
 ```json
 {
   "mcpServers": {
-    "bridge-aggregator": {
+    "bridgekitty": {
       "command": "node",
-      "args": ["/absolute/path/to/mcp-bridge-aggregator/dist/index.js"]
+      "args": ["/absolute/path/to/bridgekitty/dist/index.js"]
     }
   }
 }
@@ -103,7 +103,7 @@ MCP Client (Agent)
     |
     | MCP Protocol (stdio)
     v
-MCP Bridge Aggregator Server
+BridgeKitty Server
     |
     +-- Tool Layer (5 tools)
     |       |

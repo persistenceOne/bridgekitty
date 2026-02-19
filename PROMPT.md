@@ -1,6 +1,6 @@
 # Build Instructions
 
-Build an MCP Bridge Aggregator server based on SPEC.md in this repo.
+Build the BridgeKitty MCP server based on SPEC.md in this repo.
 
 ## MVP Scope (what to build NOW):
 1. TypeScript MCP server using @modelcontextprotocol/sdk
@@ -31,8 +31,8 @@ Build an MCP Bridge Aggregator server based on SPEC.md in this repo.
 ## Quality:
 - Working TypeScript that compiles
 - README with install + usage instructions
-- Package name: @anthropic-labs/mcp-bridge-aggregator (placeholder, will change)
+- Package name: bridgekitty
 
 Read SPEC.md for full details on API endpoints, data structures, and tool definitions.
 
-When completely finished, run: openclaw system event --text "Done: MCP Bridge Aggregator MVP built - LI.FI + Persistence backends, 5 tools, routing engine" --mode now
+When completely finished, run: openclaw system event --text "Done: BridgeKitty MVP built - LI.FI + Persistence backends, 5 tools, routing engine" --mode now

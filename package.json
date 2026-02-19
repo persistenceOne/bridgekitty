@@ -1,11 +1,11 @@
 {
-  "name": "@anthropic-labs/mcp-bridge-aggregator",
+  "name": "bridgekitty",
   "version": "0.1.0",
-  "description": "MCP server for cross-chain bridge aggregation - one tool, all bridges, best routes",
+  "description": "BridgeKitty 🐱 — Cross-chain bridge aggregator for AI agents. One tool, all bridges, best routes.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-bridge-aggregator": "dist/index.js"
+    "bridgekitty": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",

@@ -24,7 +24,7 @@ const engine = new RoutingEngine([lifi, persistence]);
 
 // Create MCP server
 const server = new McpServer({
-  name: "bridge-aggregator",
+  name: "bridgekitty",
   version: "0.1.0",
 });
 
@@ -39,7 +39,7 @@ registerGetTokens(server, engine);
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Bridge Aggregator MCP server running on stdio");
+  console.error("BridgeKitty 🐱 MCP server running on stdio");
 }
 
 main().catch((err) => {

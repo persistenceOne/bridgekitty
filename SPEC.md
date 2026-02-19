@@ -1,4 +1,4 @@
-# MCP Bridge Aggregator Server — Technical Spec
+# BridgeKitty — Technical Spec
 
 **Author:** Forge ⚒️ (Head of Engineering, Persistence Labs)  
 **Date:** 2026-02-19  
@@ -108,7 +108,7 @@ A single MCP server that any AI agent can install to bridge tokens across chains
 └──────────────────────┬──────────────────────────────┘
                        │ MCP Protocol (stdio/SSE)
 ┌──────────────────────▼──────────────────────────────┐
-│              MCP Bridge Aggregator Server            │
+│                BridgeKitty Server                    │
 │                                                     │
 │  ┌───────────┐  ┌──────────┐  ┌──────────────────┐ │
 │  │ Tool Layer│  │ Routing  │  │  Status Tracker   │ │
@@ -150,7 +150,7 @@ A single MCP server that any AI agent can install to bridge tokens across chains
 ### 3.2 Directory Structure
 
 ```
-mcp-bridge-aggregator/
+bridgekitty/
 ├── src/
 │   ├── index.ts              # MCP server entry
 │   ├── tools/
@@ -599,7 +599,7 @@ If a bridge fails, `bridge_status` returns `suggestedAction`:
 
 - **LI.FI API**: Free tier (rate-limited), paid plans for higher throughput. Integrator fee is how THEY monetize you (they take a cut of the fee param).
 - **Socket/Bungee**: Similar model. Free API, integrator fees.
-- **No MCP bridge aggregator exists yet** — we set the pricing.
+- **No MCP bridge aggregator exists yet** — BridgeKitty sets the pricing.
 
 ---
 
@@ -625,8 +625,8 @@ If a bridge fails, `bridge_status` returns `suggestedAction`:
 
 ### 10.3 Other Channels
 
-- **npm**: `@persistence-labs/mcp-bridge-aggregator`
-- **Docker**: `ghcr.io/persistence-labs/mcp-bridge-aggregator`
+- **npm**: `bridgekitty`
+- **Docker**: `ghcr.io/persistence-labs/bridgekitty`
 - **llms.txt**: Host at `https://persistence.one/llms.txt` pointing to MCP server docs
 - **GitHub**: Open source (MIT) for maximum adoption
 
@@ -722,7 +722,7 @@ If a bridge fails, `bridge_status` returns `suggestedAction`:
 ## 15. Open Questions for Dneorej
 
 1. **Open source?** Recommend MIT for maximum adoption. Revenue comes from integrator fees, not software licensing.
-2. **Branding:** `@persistence-labs/mcp-bridge` or separate brand?
+2. **Branding:** BridgeKitty (decided)
 3. **API key requirement:** Should we gate behind an API key from Day 1 (for tracking) or keep it fully open?
 4. **Signing mode:** Should MVP support delegated signing, or unsigned-only?
 5. **Priority on Across integration:** It's the most complex (contract interaction). Worth the effort for V1, or defer?
