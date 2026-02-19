@@ -4,6 +4,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { LiFiBackend } from "./backends/lifi.js";
 import { PersistenceBackend } from "./backends/persistence.js";
+import { DeBridgeBackend } from "./backends/debridge.js";
+import { RelayBackend } from "./backends/relay.js";
+import { AcrossBackend } from "./backends/across.js";
 import { RoutingEngine } from "./routing/engine.js";
 import { registerGetQuote } from "./tools/get-quote.js";
 import { registerExecuteBridge } from "./tools/execute-bridge.js";
@@ -18,9 +21,12 @@ const lifi = new LiFiBackend(
   process.env.LIFI_FEE
 );
 const persistence = new PersistenceBackend();
+const debridge = new DeBridgeBackend();
+const relay = new RelayBackend();
+const across = new AcrossBackend();
 
 // Initialize routing engine
-const engine = new RoutingEngine([lifi, persistence]);
+const engine = new RoutingEngine([lifi, persistence, debridge, relay, across]);
 
 // Create MCP server
 const server = new McpServer({
