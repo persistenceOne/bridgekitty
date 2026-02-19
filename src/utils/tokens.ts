@@ -92,10 +92,11 @@ export function resolveTokenAddress(
 }
 
 export function formatTokenAmount(amountRaw: string, decimals: number): string {
+  if (!amountRaw || amountRaw === "0") return "0";
   const str = amountRaw.padStart(decimals + 1, "0");
   const intPart = str.slice(0, str.length - decimals) || "0";
   const fracPart = str.slice(str.length - decimals);
-  const trimmed = fracPart.replace(/0+$/, "");
+  const trimmed = fracPart.replace(/0+$/, "").slice(0, 8);
   return trimmed ? `${intPart}.${trimmed}` : intPart;
 }
 

@@ -34,9 +34,16 @@ export class PersistenceBackend {
             const toBtc = BTC_TOKENS[params.toChainId];
             if (!fromBtc || !toBtc)
                 return null;
-            // Check if the tokens match our supported BTC variants
-            if (params.fromTokenAddress.toLowerCase() !== fromBtc.address.toLowerCase() &&
-                params.fromTokenAddress.toUpperCase() !== fromBtc.symbol.toUpperCase()) {
+            // Check if the from token matches our supported BTC variant (address or symbol)
+            const fromAddr = params.fromTokenAddress.toLowerCase();
+            if (fromAddr !== fromBtc.address.toLowerCase() &&
+                fromAddr !== fromBtc.symbol.toLowerCase()) {
+                return null;
+            }
+            // Check if the to token matches our supported BTC variant
+            const toAddr = params.toTokenAddress.toLowerCase();
+            if (toAddr !== toBtc.address.toLowerCase() &&
+                toAddr !== toBtc.symbol.toLowerCase()) {
                 return null;
             }
             const data = await fetchJson(`${BASE_URL}/quotes/request`, {

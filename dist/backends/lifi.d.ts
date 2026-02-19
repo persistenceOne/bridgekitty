@@ -2,7 +2,9 @@ import type { BridgeBackend, BridgeQuote, BridgeStatus, ChainInfo, QuoteParams, 
 export declare class LiFiBackend implements BridgeBackend {
     name: string;
     private apiKey?;
-    constructor(apiKey?: string);
+    private integrator?;
+    private integratorFee?;
+    constructor(apiKey?: string, integrator?: string, integratorFee?: string);
     private headers;
     getQuote(params: QuoteParams): Promise<BridgeQuote | null>;
     buildTransaction(quote: BridgeQuote): Promise<TransactionRequest>;

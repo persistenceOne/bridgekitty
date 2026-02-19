@@ -10,7 +10,7 @@ import { registerCheckStatus } from "./tools/check-status.js";
 import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
 // Initialize backends
-const lifi = new LiFiBackend(process.env.LIFI_API_KEY);
+const lifi = new LiFiBackend(process.env.LIFI_API_KEY, process.env.LIFI_INTEGRATOR, process.env.LIFI_FEE);
 const persistence = new PersistenceBackend();
 // Initialize routing engine
 const engine = new RoutingEngine([lifi, persistence]);

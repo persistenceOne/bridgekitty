@@ -1,6 +1,5 @@
+import { formatTokenAmount } from "../utils/tokens.js";
 const BASE_URL = "https://li.quest/v1";
-const INTEGRATOR = "persistence-bridge";
-const INTEGRATOR_FEE = "0.003"; // 0.3%
 const TIMEOUT_MS = 15_000;
 async function fetchJson(url, init) {
     const controller = new AbortController();
@@ -20,8 +19,12 @@ async function fetchJson(url, init) {
 export class LiFiBackend {
     name = "lifi";
     apiKey;
-    constructor(apiKey) {
+    integrator;
+    integratorFee;
+    constructor(apiKey, integrator, integratorFee) {
         this.apiKey = apiKey;
+        this.integrator = integrator;
+        this.integratorFee = integratorFee;
     }
     headers() {
         const h = { Accept: "application/json" };
@@ -42,14 +45,17 @@ export class LiFiBackend {
                 url.searchParams.set("toAddress", params.toAddress);
             url.searchParams.set("order", params.preference === "fastest" ? "FASTEST" : "CHEAPEST");
             url.searchParams.set("slippage", "0.005");
-            url.searchParams.set("integrator", INTEGRATOR);
-            url.searchParams.set("fee", INTEGRATOR_FEE);
+            if (this.integrator) {
+                url.searchParams.set("integrator", this.integrator);
+                if (this.integratorFee)
+                    url.searchParams.set("fee", this.integratorFee);
+            }
             const data = await fetchJson(url.toString(), { headers: this.headers() });
             const gasCostUsd = data.estimate?.gasCosts?.reduce((sum, g) => sum + Number(g.amountUSD || 0), 0) ?? 0;
             return {
                 provider: "lifi",
                 outputAmount: data.estimate?.toAmountMin
-                    ? formatLifiAmount(data.estimate.toAmountMin, data.action?.toToken?.decimals ?? 18)
+                    ? formatTokenAmount(data.estimate.toAmountMin, data.action?.toToken?.decimals ?? 18)
                     : "0",
                 outputAmountRaw: data.estimate?.toAmountMin ?? "0",
                 estimatedFeeUsd: gasCostUsd,
@@ -165,15 +171,6 @@ export class LiFiBackend {
             logoURI: t.logoURI,
         }));
     }
-}
-function formatLifiAmount(raw, decimals) {
-    if (!raw || raw === "0")
-        return "0";
-    const str = raw.padStart(decimals + 1, "0");
-    const intPart = str.slice(0, str.length - decimals) || "0";
-    const fracPart = str.slice(str.length - decimals);
-    const trimmed = fracPart.replace(/0+$/, "").slice(0, 6);
-    return trimmed ? `${intPart}.${trimmed}` : intPart;
 }
 function buildApproveData(spender, amount) {
     // ERC20 approve(address,uint256) selector = 0x095ea7b3

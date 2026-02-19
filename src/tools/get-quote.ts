@@ -100,7 +100,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           estimatedFeeUsd: best.estimatedFeeUsd,
           estimatedTimeSeconds: best.estimatedTimeSeconds,
           route: best.route,
-          quoteId: (best as any)._cacheKey,
+          quoteId: best.quoteId,
         },
         alternatives: quotes.slice(1, 3).map((q) => ({
           provider: q.provider,
@@ -108,7 +108,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           estimatedFeeUsd: q.estimatedFeeUsd,
           estimatedTimeSeconds: q.estimatedTimeSeconds,
           route: q.route,
-          quoteId: (q as any)._cacheKey,
+          quoteId: q.quoteId,
         })),
         summary: `Best: ${best.outputAmount} ${params.toToken} via ${best.provider} (fee: ~$${best.estimatedFeeUsd.toFixed(2)}, ETA: ${best.estimatedTimeSeconds}s). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
       };

@@ -22,8 +22,9 @@ const CHAINS: ChainEntry[] = [
 ];
 
 export function resolveChainId(input: string): number | null {
+  // Accept any positive integer chain ID (not just hardcoded ones)
   const num = Number(input);
-  if (!isNaN(num) && CHAINS.some((c) => c.id === num)) return num;
+  if (!isNaN(num) && Number.isInteger(num) && num > 0) return num;
   const lower = input.toLowerCase().trim();
   const match = CHAINS.find((c) => c.key === lower || c.name.toLowerCase() === lower);
   return match?.id ?? null;

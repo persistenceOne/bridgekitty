@@ -1,4 +1,9 @@
+import crypto from "node:crypto";
 import type { BridgeBackend, BridgeQuote, QuoteParams } from "../backends/types.js";
+
+export interface CachedQuote extends BridgeQuote {
+  quoteId: string;
+}
 
 export class RoutingEngine {
   private backends: BridgeBackend[];
@@ -8,7 +13,7 @@ export class RoutingEngine {
     this.backends = backends;
   }
 
-  async getQuotes(params: QuoteParams): Promise<BridgeQuote[]> {
+  async getQuotes(params: QuoteParams): Promise<CachedQuote[]> {
     const results = await Promise.allSettled(
       this.backends.map((b) =>
         Promise.race([
@@ -31,31 +36,37 @@ export class RoutingEngine {
       quotes.sort((a, b) => a.estimatedTimeSeconds - b.estimatedTimeSeconds);
     } else {
       // Cheapest = highest output (best deal for the user)
-      quotes.sort(
-        (a, b) => Number(BigInt(b.outputAmountRaw) - BigInt(a.outputAmountRaw))
-      );
+      quotes.sort((a, b) => {
+        try {
+          const diff = BigInt(b.outputAmountRaw) - BigInt(a.outputAmountRaw);
+          return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+        } catch {
+          return 0;
+        }
+      });
     }
 
-    // Cache quotes for execution
+    // Cache quotes for execution and assign stable IDs
+    const cachedQuotes: CachedQuote[] = [];
     for (const q of quotes) {
-      const cacheKey = `${q.provider}:${Date.now()}`;
-      this.quoteCache.set(cacheKey, { quote: q, expiresAt: q.expiresAt });
-      (q as any)._cacheKey = cacheKey;
+      const quoteId = crypto.randomUUID();
+      this.quoteCache.set(quoteId, { quote: q, expiresAt: q.expiresAt });
+      cachedQuotes.push({ ...q, quoteId });
     }
 
-    // Clean expired
+    // Clean expired entries
     const now = Date.now();
     for (const [key, val] of this.quoteCache) {
       if (val.expiresAt < now) this.quoteCache.delete(key);
     }
 
-    return quotes;
+    return cachedQuotes;
   }
 
-  getCachedQuote(cacheKey: string): BridgeQuote | null {
-    const entry = this.quoteCache.get(cacheKey);
+  getCachedQuote(quoteId: string): BridgeQuote | null {
+    const entry = this.quoteCache.get(quoteId);
     if (!entry || entry.expiresAt < Date.now()) {
-      this.quoteCache.delete(cacheKey);
+      this.quoteCache.delete(quoteId);
       return null;
     }
     return entry.quote;
