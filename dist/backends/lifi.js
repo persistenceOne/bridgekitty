@@ -33,48 +33,120 @@ export class LiFiBackend {
         return h;
     }
     async getQuote(params) {
+        const quotes = await this.getQuotes(params);
+        return quotes.length > 0 ? quotes[0] : null;
+    }
+    /**
+     * Fetch multiple routes via LI.FI /advanced/routes endpoint.
+     * Returns up to 5 route options with full fee breakdowns.
+     */
+    async getQuotes(params) {
         try {
-            const url = new URL(`${BASE_URL}/quote`);
-            url.searchParams.set("fromChain", String(params.fromChainId));
-            url.searchParams.set("toChain", String(params.toChainId));
-            url.searchParams.set("fromToken", params.fromTokenAddress);
-            url.searchParams.set("toToken", params.toTokenAddress);
-            url.searchParams.set("fromAmount", params.amountRaw);
-            url.searchParams.set("fromAddress", params.fromAddress);
-            if (params.toAddress)
-                url.searchParams.set("toAddress", params.toAddress);
-            url.searchParams.set("order", params.preference === "fastest" ? "FASTEST" : "CHEAPEST");
-            url.searchParams.set("slippage", "0.005");
-            if (this.integrator) {
-                url.searchParams.set("integrator", this.integrator);
-                if (this.integratorFee)
-                    url.searchParams.set("fee", this.integratorFee);
-            }
-            const data = await fetchJson(url.toString(), { headers: this.headers() });
-            const gasCostUsd = data.estimate?.gasCosts?.reduce((sum, g) => sum + Number(g.amountUSD || 0), 0) ?? 0;
-            return {
-                provider: "lifi",
-                outputAmount: data.estimate?.toAmountMin
-                    ? formatTokenAmount(data.estimate.toAmountMin, data.action?.toToken?.decimals ?? 18)
-                    : "0",
-                outputAmountRaw: data.estimate?.toAmountMin ?? "0",
-                estimatedFeeUsd: gasCostUsd,
-                estimatedTimeSeconds: data.estimate?.executionDuration ?? 300,
-                route: `${data.action?.fromToken?.symbol ?? "?"} → ${data.toolDetails?.name ?? data.tool ?? "LI.FI"} → ${data.action?.toToken?.symbol ?? "?"}`,
-                quoteData: data,
-                expiresAt: Date.now() + 60_000,
+            const body = {
+                fromChainId: params.fromChainId,
+                toChainId: params.toChainId,
+                fromTokenAddress: params.fromTokenAddress,
+                toTokenAddress: params.toTokenAddress,
+                fromAmount: params.amountRaw,
+                fromAddress: params.fromAddress,
+                toAddress: params.toAddress || params.fromAddress,
+                options: {
+                    order: params.preference === "fastest" ? "FASTEST" : "CHEAPEST",
+                    slippage: 0.005,
+                    maxPriceImpact: 0.4,
+                    allowSwitchChain: false,
+                },
             };
+            if (this.integrator) {
+                body.options.integrator = this.integrator;
+                if (this.integratorFee)
+                    body.options.fee = parseFloat(this.integratorFee);
+            }
+            const data = await fetchJson(`${BASE_URL}/advanced/routes`, {
+                method: "POST",
+                headers: { ...this.headers(), "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const routes = data.routes ?? [];
+            if (routes.length === 0)
+                return [];
+            const integratorFeePercent = this.integratorFee
+                ? `${(parseFloat(this.integratorFee) * 100).toFixed(1)}%`
+                : null;
+            return routes.slice(0, 5).map((route) => {
+                const steps = route.steps ?? [];
+                const firstStep = steps[0];
+                const lastStep = steps[steps.length - 1];
+                // Fee breakdown from route data
+                const gasCostUsd = route.gasCostUSD ? parseFloat(route.gasCostUSD) : 0;
+                // Extract protocol fees from step fee costs
+                let protocolFeeUsd = 0;
+                let integratorFeeUsd = 0;
+                for (const step of steps) {
+                    const estimate = step.estimate ?? {};
+                    const feeCosts = estimate.feeCosts ?? [];
+                    for (const fee of feeCosts) {
+                        const usd = parseFloat(fee.amountUSD || "0");
+                        if (fee.name?.toLowerCase().includes("integrator") ||
+                            fee.name?.toLowerCase().includes("affiliate")) {
+                            integratorFeeUsd += usd;
+                        }
+                        else {
+                            protocolFeeUsd += usd;
+                        }
+                    }
+                }
+                const totalFeeUsd = gasCostUsd + protocolFeeUsd + integratorFeeUsd;
+                const feeBreakdown = {
+                    gasCostUsd: Math.round(gasCostUsd * 100) / 100,
+                    protocolFeeUsd: Math.round(protocolFeeUsd * 100) / 100,
+                    integratorFeeUsd: Math.round(integratorFeeUsd * 100) / 100,
+                    integratorFeePercent,
+                    totalFeeUsd: Math.round(totalFeeUsd * 100) / 100,
+                };
+                // Build human-readable route description
+                const toolNames = steps
+                    .map((s) => s.toolDetails?.name ?? s.tool ?? "?")
+                    .join(" → ");
+                const fromSymbol = firstStep?.action?.fromToken?.symbol ?? "?";
+                const toSymbol = lastStep?.action?.toToken?.symbol ?? "?";
+                const toDecimals = lastStep?.action?.toToken?.decimals ?? 18;
+                return {
+                    provider: `${toolNames} via LI.FI`,
+                    outputAmount: route.toAmount
+                        ? formatTokenAmount(route.toAmount, toDecimals)
+                        : "0",
+                    outputAmountRaw: route.toAmount ?? "0",
+                    estimatedFeeUsd: totalFeeUsd,
+                    feeBreakdown,
+                    estimatedTimeSeconds: steps.reduce((sum, s) => sum + (s.estimate?.executionDuration ?? 0), 0) || 300,
+                    route: `${fromSymbol} → ${toolNames} → ${toSymbol}`,
+                    quoteData: route,
+                    expiresAt: Date.now() + 60_000,
+                };
+            });
         }
         catch (err) {
-            console.error("[lifi] quote error:", err.message);
-            return null;
+            console.error("[lifi] advanced/routes error:", err.message);
+            return [];
         }
     }
     async buildTransaction(quote) {
-        const data = quote.quoteData;
-        const txReq = data.transactionRequest;
+        const route = quote.quoteData;
+        // For /advanced/routes, get step transaction from the first step
+        const step = route.steps?.[0];
+        if (!step)
+            throw new Error("No steps in LI.FI route");
+        // Call /advanced/stepTransaction to get the actual tx data
+        const stepData = await fetchJson(`${BASE_URL}/advanced/stepTransaction`, {
+            method: "POST",
+            headers: { ...this.headers(), "Content-Type": "application/json" },
+            body: JSON.stringify(step),
+        });
+        const txReq = stepData.transactionRequest;
         if (!txReq)
-            throw new Error("No transactionRequest in LI.FI quote");
+            throw new Error("No transactionRequest in LI.FI step response");
+        const toolName = step.tool ?? step.toolDetails?.name ?? "unknown";
         const result = {
             to: txReq.to,
             data: txReq.data,
@@ -82,17 +154,18 @@ export class LiFiBackend {
             chainId: txReq.chainId,
             gasLimit: txReq.gasLimit,
             provider: "lifi",
-            trackingId: `lifi:${data.tool ?? "unknown"}:${Date.now()}`,
+            trackingId: `lifi:${toolName}:${Date.now()}`,
         };
         // Check if approval is needed
-        if (data.estimate?.approvalAddress && data.action?.fromToken?.address) {
-            const tokenAddr = data.action.fromToken.address;
+        const estimate = stepData.estimate ?? step.estimate;
+        const action = stepData.action ?? step.action;
+        if (estimate?.approvalAddress && action?.fromToken?.address) {
+            const tokenAddr = action.fromToken.address;
             // Non-native tokens may need approval
             if (tokenAddr !== "0x0000000000000000000000000000000000000000") {
-                // LI.FI quote includes approval info but not the tx — agent handles ERC20 approve
                 result.approvalTx = {
                     to: tokenAddr,
-                    data: buildApproveData(data.estimate.approvalAddress, data.action.fromAmount),
+                    data: buildApproveData(estimate.approvalAddress, action.fromAmount),
                     value: "0x0",
                     chainId: txReq.chainId,
                 };

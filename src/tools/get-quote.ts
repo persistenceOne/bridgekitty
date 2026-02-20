@@ -33,7 +33,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         .describe("Recipient address (defaults to fromAddress)"),
       preference: z
         .enum(["cheapest", "fastest"])
-        .default("cheapest")
+        .default("fastest")
         .describe("Optimize for lowest cost or fastest delivery"),
     },
     async (params) => {
@@ -92,25 +92,62 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         };
       }
 
+      // Determine fastest and best-rate quotes
+      const fastestTime = Math.min(...quotes.map((q) => q.estimatedTimeSeconds));
+      let bestOutputRaw = quotes[0].outputAmountRaw;
+      for (const q of quotes) {
+        try {
+          if (BigInt(q.outputAmountRaw) > BigInt(bestOutputRaw)) {
+            bestOutputRaw = q.outputAmountRaw;
+          }
+        } catch {}
+      }
+
+      function tagsFor(q: typeof quotes[number]): string[] {
+        const t: string[] = [];
+        if (q.estimatedTimeSeconds === fastestTime) t.push("⚡ fastest");
+        try {
+          if (BigInt(q.outputAmountRaw) === BigInt(bestOutputRaw)) t.push("💰 best rate");
+        } catch {}
+        return t;
+      }
+
       const best = quotes[0];
-      const response = {
-        bestQuote: {
-          provider: best.provider,
-          outputAmount: best.outputAmount,
-          estimatedFeeUsd: best.estimatedFeeUsd,
-          estimatedTimeSeconds: best.estimatedTimeSeconds,
-          route: best.route,
-          quoteId: best.quoteId,
-        },
-        alternatives: quotes.slice(1, 3).map((q) => ({
+      const bestTags = tagsFor(best);
+      const tagStr = bestTags.length > 0 ? " " + bestTags.map((t) => t.replace(/^(⚡|💰) .*/, "$1")).join("") : "";
+
+      function formatQuote(q: typeof quotes[number]) {
+        const base: Record<string, any> = {
           provider: q.provider,
           outputAmount: q.outputAmount,
-          estimatedFeeUsd: q.estimatedFeeUsd,
           estimatedTimeSeconds: q.estimatedTimeSeconds,
           route: q.route,
           quoteId: q.quoteId,
-        })),
-        summary: `Best: ${best.outputAmount} ${params.toToken} via ${best.provider} (fee: ~$${best.estimatedFeeUsd.toFixed(2)}, ETA: ${best.estimatedTimeSeconds}s). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
+          tags: tagsFor(q),
+          fees: {
+            totalUsd: `$${q.estimatedFeeUsd.toFixed(2)}`,
+            breakdown: {
+              gasCost: `$${q.feeBreakdown.gasCostUsd.toFixed(2)}`,
+              protocolFee: `$${q.feeBreakdown.protocolFeeUsd.toFixed(2)}`,
+              integratorFee: q.feeBreakdown.integratorFeeUsd > 0
+                ? `$${q.feeBreakdown.integratorFeeUsd.toFixed(2)}${q.feeBreakdown.integratorFeePercent ? ` (${q.feeBreakdown.integratorFeePercent})` : ""}`
+                : "none",
+            },
+          },
+        };
+        return base;
+      }
+
+      const integratorNote = best.feeBreakdown.integratorFeePercent
+        ? `Includes ${best.feeBreakdown.integratorFeePercent} integrator fee. Configure via LIFI_FEE env var (0-0.04).`
+        : undefined;
+
+      const response = {
+        bestQuote: formatQuote(best),
+        alternatives: quotes.slice(1, 5).map(formatQuote),
+        totalRoutesFound: quotes.length,
+        summary: `Best: ${best.outputAmount} ${params.toToken} via ${best.provider}${tagStr} (fee: ~$${best.estimatedFeeUsd.toFixed(2)}, ETA: ${best.estimatedTimeSeconds}s). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
+        ...(integratorNote ? { integratorFeeNote: integratorNote } : {}),
       };
 
       return {

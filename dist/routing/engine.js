@@ -6,13 +6,16 @@ export class RoutingEngine {
         this.backends = backends;
     }
     async getQuotes(params) {
+        // Use getQuotes (multi-route) when available, fall back to getQuote (single)
         const results = await Promise.allSettled(this.backends.map((b) => Promise.race([
-            b.getQuote(params),
-            new Promise((resolve) => setTimeout(() => resolve(null), 12_000)),
+            b.getQuotes
+                ? b.getQuotes(params)
+                : b.getQuote(params).then((q) => (q ? [q] : [])),
+            new Promise((resolve) => setTimeout(() => resolve([]), 12_000)),
         ])));
         const quotes = results
             .filter((r) => r.status === "fulfilled")
-            .map((r) => r.value)
+            .flatMap((r) => r.value)
             .filter((q) => q !== null);
         // Sort by preference
         if (params.preference === "fastest") {

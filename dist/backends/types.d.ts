@@ -8,11 +8,19 @@ export interface QuoteParams {
     toAddress?: string;
     preference: "cheapest" | "fastest";
 }
+export interface FeeBreakdown {
+    gasCostUsd: number;
+    protocolFeeUsd: number;
+    integratorFeeUsd: number;
+    integratorFeePercent: string | null;
+    totalFeeUsd: number;
+}
 export interface BridgeQuote {
     provider: string;
     outputAmount: string;
     outputAmountRaw: string;
     estimatedFeeUsd: number;
+    feeBreakdown: FeeBreakdown;
     estimatedTimeSeconds: number;
     route: string;
     quoteData: unknown;
@@ -60,6 +68,8 @@ export interface TokenInfo {
 export interface BridgeBackend {
     name: string;
     getQuote(params: QuoteParams): Promise<BridgeQuote | null>;
+    /** Return multiple route options. Default implementation wraps getQuote. */
+    getQuotes?(params: QuoteParams): Promise<BridgeQuote[]>;
     buildTransaction(quote: BridgeQuote): Promise<TransactionRequest>;
     getStatus(trackingId: string, meta?: Record<string, string>): Promise<BridgeStatus>;
     getSupportedChains(): Promise<ChainInfo[]>;

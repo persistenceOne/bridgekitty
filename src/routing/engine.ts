@@ -14,21 +14,24 @@ export class RoutingEngine {
   }
 
   async getQuotes(params: QuoteParams): Promise<CachedQuote[]> {
+    // Use getQuotes (multi-route) when available, fall back to getQuote (single)
     const results = await Promise.allSettled(
       this.backends.map((b) =>
         Promise.race([
-          b.getQuote(params),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 12_000)),
+          b.getQuotes
+            ? b.getQuotes(params)
+            : b.getQuote(params).then((q) => (q ? [q] : [])),
+          new Promise<BridgeQuote[]>((resolve) => setTimeout(() => resolve([]), 12_000)),
         ])
       )
     );
 
     const quotes = results
       .filter(
-        (r): r is PromiseFulfilledResult<BridgeQuote | null> =>
+        (r): r is PromiseFulfilledResult<BridgeQuote[]> =>
           r.status === "fulfilled"
       )
-      .map((r) => r.value)
+      .flatMap((r) => r.value)
       .filter((q): q is BridgeQuote => q !== null);
 
     // Sort by preference

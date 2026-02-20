@@ -19,7 +19,20 @@ const CHAINS: ChainEntry[] = [
   { id: 81457, name: "Blast", key: "blast" },
   { id: 7777777, name: "Zora", key: "zora" },
   { id: 34443, name: "Mode", key: "mode" },
+  { id: 1151111081099710, name: "Solana", key: "solana" },
 ];
+
+// Backend-specific chain ID overrides (Solana has different IDs per provider)
+const CHAIN_ID_OVERRIDES: Record<string, Record<number, number>> = {
+  debridge: {
+    1151111081099710: 7565164, // deBridge uses 7565164 for Solana
+  },
+};
+
+export function getBackendChainId(backendName: string, chainId: number): number {
+  const key = backendName.toLowerCase().replace(/\s*\(.*\)/, "");
+  return CHAIN_ID_OVERRIDES[key]?.[chainId] ?? chainId;
+}
 
 export function resolveChainId(input: string): number | null {
   // Accept any positive integer chain ID (not just hardcoded ones)

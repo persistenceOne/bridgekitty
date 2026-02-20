@@ -35,6 +35,10 @@ const SPOKE_POOLS = {
 };
 export class AcrossBackend {
     name = "across";
+    referrer;
+    constructor(referrer) {
+        this.referrer = referrer;
+    }
     async getQuote(params) {
         try {
             // Across uses suggested-fees to get the fee structure for a route
@@ -43,6 +47,9 @@ export class AcrossBackend {
             url.searchParams.set("destinationChainId", String(params.toChainId));
             url.searchParams.set("token", params.fromTokenAddress);
             url.searchParams.set("amount", params.amountRaw);
+            if (this.referrer) {
+                url.searchParams.set("referrer", this.referrer);
+            }
             const data = await fetchJson(url.toString());
             if (!data.totalRelayFee)
                 return null;
@@ -57,10 +64,11 @@ export class AcrossBackend {
             const feeUsd = Number(data.totalRelayFee.total ?? "0") / Math.pow(10, decimals);
             const estimatedFillTime = data.estimatedFillTimeSec ?? 120;
             return {
-                provider: "across",
+                provider: "Across (direct)",
                 outputAmount: formatTokenAmount(outputRaw, decimals),
                 outputAmountRaw: outputRaw,
                 estimatedFeeUsd: feeUsd,
+                feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
                 estimatedTimeSeconds: estimatedFillTime,
                 route: `Across Protocol (fast bridge)`,
                 quoteData: {

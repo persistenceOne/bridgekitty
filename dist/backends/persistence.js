@@ -1,3 +1,4 @@
+import { formatTokenAmount } from "../utils/tokens.js";
 const BASE_URL = "https://api.interop.persistence.one";
 const TIMEOUT_MS = 15_000;
 async function fetchJson(url, init) {
@@ -52,24 +53,31 @@ export class PersistenceBackend {
                 body: JSON.stringify({
                     sourceChainId: params.fromChainId,
                     destinationChainId: params.toChainId,
-                    sourceToken: fromBtc.address,
-                    destinationToken: toBtc.address,
-                    amount: params.amountRaw,
-                    senderAddress: params.fromAddress,
-                    recipientAddress: params.toAddress ?? params.fromAddress,
+                    sourceAsset: fromBtc.address,
+                    destinationAsset: toBtc.address,
+                    sourceAmount: params.amountRaw,
                 }),
             });
-            if (!data || data.error)
+            // API returns {quotes: [...]} or an array
+            const quotes = Array.isArray(data) ? data : (data.quotes ?? [data]);
+            if (!quotes.length || quotes[0]?.error)
                 return null;
+            const best = quotes.reduce((a, b) => BigInt(b.estimatedDestinationAmount ?? "0") > BigInt(a.estimatedDestinationAmount ?? "0") ? b : a);
+            const dstDecimals = toBtc.symbol === "BTCB" ? 18 : 8; // BTCB is 18 decimals on BSC
+            const outputRaw = best.estimatedDestinationAmount ?? "0";
+            const totalFeeBps = Number(best.totalFee ?? 0);
+            // Fee is in basis units of the source token
+            const feeUsd = 0; // Hard to convert to USD without price; leave 0 for now
             return {
-                provider: "persistence",
-                outputAmount: data.estimatedOutput ?? data.outputAmount ?? "0",
-                outputAmountRaw: data.estimatedOutputRaw ?? params.amountRaw,
-                estimatedFeeUsd: data.totalFee ?? 0,
-                estimatedTimeSeconds: data.estimatedTime ?? 120,
+                provider: "Persistence Interop (direct)",
+                outputAmount: formatTokenAmount(outputRaw, dstDecimals),
+                outputAmountRaw: outputRaw,
+                estimatedFeeUsd: feeUsd,
+                feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
+                estimatedTimeSeconds: 120,
                 route: `${fromBtc.symbol} → Persistence Solver → ${toBtc.symbol}`,
-                quoteData: data,
-                expiresAt: Date.now() + 60_000,
+                quoteData: best,
+                expiresAt: best.expirationTime ? new Date(best.expirationTime).getTime() : Date.now() + 60_000,
             };
         }
         catch (err) {

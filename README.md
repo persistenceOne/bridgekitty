@@ -62,11 +62,16 @@ node dist/index.js
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `LIFI_API_KEY` | No | LI.FI API key for higher rate limits (free tier: 75 req/s) |
-| `LIFI_INTEGRATOR` | No | LI.FI integrator ID (register at https://portal.li.fi/) |
-| `LIFI_FEE` | No | Integrator fee as decimal (e.g. `0.003` for 0.3%). Requires registered integrator. |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LIFI_API_KEY` | No | — | LI.FI API key for higher rate limits (free tier: 75 req/s) |
+| `LIFI_INTEGRATOR` | No | — | LI.FI integrator ID (register at https://portal.li.fi/) |
+| `LIFI_FEE` | No | `0.001` | Integrator fee as decimal (0.001 = 0.1%). Requires registered integrator. |
+| `DEBRIDGE_AFFILIATE_FEE` | No | `0.1` | deBridge affiliate fee as percent (0.1 = 0.1%) |
+| `DEBRIDGE_AFFILIATE_ADDRESS` | No | — | Address to receive deBridge affiliate fees (origin chain) |
+| `ACROSS_REFERRAL_ADDRESS` | No | — | Referrer address for Across LP fee sharing |
+| `RELAY_REFERRER_ADDRESS` | No | — | Address to receive Relay app fees |
+| `RELAY_APP_FEE` | No | `10` | Relay app fee in basis points (10 = 0.1%) |
 
 ## Example Flow
 
@@ -111,12 +116,23 @@ BridgeKitty Server
     |       |
     +-- Backend Adapters
             +-- LI.FI (59+ chains)
+            +-- deBridge DLN
+            +-- Across Protocol
+            +-- Relay
             +-- Persistence Interop (BTC swaps)
 ```
 
 ## Revenue Model
 
-When `LIFI_INTEGRATOR` and `LIFI_FEE` are configured with a registered integrator, a fee is applied to LI.FI routes automatically. Register at https://portal.li.fi/ to set up fee collection.
+BridgeKitty earns integrator/referral fees on routes through third-party backends. Default fee: 0.1% (10 bips) where configurable. No fees on Persistence Interop (our own solver).
+
+| Backend | Fee Type | How to Enable |
+|---------|----------|---------------|
+| **LI.FI** | Integrator fee | Set `LIFI_INTEGRATOR` + `LIFI_FEE` (register at https://portal.li.fi/) |
+| **deBridge** | Affiliate fee | Set `DEBRIDGE_AFFILIATE_ADDRESS` (fee % defaults to 0.1%) |
+| **Across** | Referral fee sharing | Set `ACROSS_REFERRAL_ADDRESS` |
+| **Relay** | App fee | Set `RELAY_REFERRER_ADDRESS` (fee bps defaults to 10) |
+| **Persistence** | — | No fees (we're the solver) |
 
 ## License
 

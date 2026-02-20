@@ -13,11 +13,13 @@ import { registerCheckStatus } from "./tools/check-status.js";
 import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
 // Initialize backends
-const lifi = new LiFiBackend(process.env.LIFI_API_KEY, process.env.LIFI_INTEGRATOR, process.env.LIFI_FEE);
+// Fees are opt-in: set env vars to enable. Zero fees by default for max adoption.
+const lifi = new LiFiBackend(process.env.LIFI_API_KEY, process.env.LIFI_INTEGRATOR, process.env.LIFI_FEE // undefined = no fee (requires portal.li.fi registration)
+);
 const persistence = new PersistenceBackend();
-const debridge = new DeBridgeBackend();
-const relay = new RelayBackend();
-const across = new AcrossBackend();
+const debridge = new DeBridgeBackend(process.env.DEBRIDGE_AFFILIATE_FEE, process.env.DEBRIDGE_AFFILIATE_ADDRESS);
+const relay = new RelayBackend(process.env.RELAY_REFERRER_ADDRESS, process.env.RELAY_APP_FEE);
+const across = new AcrossBackend(process.env.ACROSS_REFERRAL_ADDRESS);
 // Initialize routing engine
 const engine = new RoutingEngine([lifi, persistence, debridge, relay, across]);
 // Create MCP server

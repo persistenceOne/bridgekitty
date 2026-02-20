@@ -48,6 +48,11 @@ const SPOKE_POOLS: Record<number, string> = {
 
 export class AcrossBackend implements BridgeBackend {
   name = "across";
+  private referrer?: string;
+
+  constructor(referrer?: string) {
+    this.referrer = referrer;
+  }
 
   async getQuote(params: QuoteParams): Promise<BridgeQuote | null> {
     try {
@@ -57,6 +62,9 @@ export class AcrossBackend implements BridgeBackend {
       url.searchParams.set("destinationChainId", String(params.toChainId));
       url.searchParams.set("token", params.fromTokenAddress);
       url.searchParams.set("amount", params.amountRaw);
+      if (this.referrer) {
+        url.searchParams.set("referrer", this.referrer);
+      }
 
       const data = await fetchJson(url.toString());
 
@@ -76,10 +84,11 @@ export class AcrossBackend implements BridgeBackend {
       const estimatedFillTime = data.estimatedFillTimeSec ?? 120;
 
       return {
-        provider: "across",
+        provider: "Across (direct)",
         outputAmount: formatTokenAmount(outputRaw, decimals),
         outputAmountRaw: outputRaw,
         estimatedFeeUsd: feeUsd,
+        feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
         estimatedTimeSeconds: estimatedFillTime,
         route: `Across Protocol (fast bridge)`,
         quoteData: {

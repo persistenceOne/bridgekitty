@@ -8,6 +8,7 @@ import type {
   TransactionRequest,
 } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
+import { getBackendChainId } from "../utils/chains.js";
 import { getAllChains } from "../utils/chains.js";
 
 const BASE_URL = "https://api.dln.trade/v1.0";
@@ -36,16 +37,29 @@ function buildApproveData(spender: string, amount: string): string {
 
 export class DeBridgeBackend implements BridgeBackend {
   name = "debridge";
+  private affiliateFeePercent?: string;
+  private affiliateFeeRecipient?: string;
+
+  constructor(affiliateFeePercent?: string, affiliateFeeRecipient?: string) {
+    this.affiliateFeePercent = affiliateFeePercent;
+    this.affiliateFeeRecipient = affiliateFeeRecipient;
+  }
 
   async getQuote(params: QuoteParams): Promise<BridgeQuote | null> {
     try {
       const url = new URL(`${BASE_URL}/dln/order/quote`);
-      url.searchParams.set("srcChainId", String(params.fromChainId));
+      const srcChainId = getBackendChainId("debridge", params.fromChainId);
+      const dstChainId = getBackendChainId("debridge", params.toChainId);
+      url.searchParams.set("srcChainId", String(srcChainId));
       url.searchParams.set("srcChainTokenIn", params.fromTokenAddress);
       url.searchParams.set("srcChainTokenInAmount", params.amountRaw);
-      url.searchParams.set("dstChainId", String(params.toChainId));
+      url.searchParams.set("dstChainId", String(dstChainId));
       url.searchParams.set("dstChainTokenOut", params.toTokenAddress);
       url.searchParams.set("prependOperatingExpenses", "true");
+      if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
+        url.searchParams.set("affiliateFeePercent", this.affiliateFeePercent);
+        url.searchParams.set("affiliateFeeRecipient", this.affiliateFeeRecipient);
+      }
 
       const data = await fetchJson(url.toString());
 
@@ -57,19 +71,17 @@ export class DeBridgeBackend implements BridgeBackend {
       const dstTokenSymbol = data.estimation.dstChainTokenOut?.symbol ?? "?";
 
       // Calculate fee from operating expenses
-      const operatingExpenseUsd = Number(data.estimation.costsDetails?.find(
-        (c: any) => c.type === "DlnProtocolFee"
-      )?.payload?.feeAmount ?? 0) / 1e6; // typically in USDC units
       const totalFeeUsd = Number(data.estimation.costsDetails?.reduce(
-        (sum: number, c: any) => sum + Number(c.payload?.feeAmountInUsd ?? 0),
+        (sum: number, c: any) => sum + Number(c.payload?.feeApproximateUsdValue ?? 0),
         0
       ) ?? 0);
 
       return {
-        provider: "debridge",
+        provider: "deBridge (direct)",
         outputAmount: formatTokenAmount(dstAmount, dstDecimals),
         outputAmountRaw: dstAmount,
-        estimatedFeeUsd: totalFeeUsd || operatingExpenseUsd,
+        estimatedFeeUsd: totalFeeUsd,
+        feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: totalFeeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd },
         estimatedTimeSeconds: data.estimation.estimatedFulfillmentDelay ?? 30,
         route: `${srcTokenSymbol} → deBridge DLN → ${dstTokenSymbol}`,
         quoteData: {
@@ -108,6 +120,10 @@ export class DeBridgeBackend implements BridgeBackend {
     url.searchParams.set("srcChainOrderAuthorityAddress", p.fromAddress);
     url.searchParams.set("dstChainTokenOutRecipient", p.toAddress);
     url.searchParams.set("prependOperatingExpenses", "true");
+    if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
+      url.searchParams.set("affiliateFeePercent", this.affiliateFeePercent);
+      url.searchParams.set("affiliateFeeRecipient", this.affiliateFeeRecipient);
+    }
 
     const data = await fetchJson(url.toString());
 

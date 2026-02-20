@@ -25,6 +25,12 @@ function buildApproveData(spender, amount) {
 }
 export class RelayBackend {
     name = "relay";
+    appFeeRecipient;
+    appFeeBps;
+    constructor(appFeeRecipient, appFeeBps) {
+        this.appFeeRecipient = appFeeRecipient;
+        this.appFeeBps = appFeeBps;
+    }
     async getQuote(params) {
         try {
             const body = {
@@ -43,6 +49,9 @@ export class RelayBackend {
             if (params.toAddress) {
                 body.recipient = params.toAddress;
             }
+            if (this.appFeeRecipient && this.appFeeBps) {
+                body.appFees = [{ recipient: this.appFeeRecipient, fee: this.appFeeBps }];
+            }
             const data = await fetchJson(`${BASE_URL}/quote`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -59,10 +68,11 @@ export class RelayBackend {
             const feeUsd = Number(details.totalFee?.usd ?? 0);
             const timeEstimate = details.timeEstimate ?? 60;
             return {
-                provider: "relay",
+                provider: "Relay (direct)",
                 outputAmount: formatTokenAmount(outputRaw, outputDecimals),
                 outputAmountRaw: outputRaw,
                 estimatedFeeUsd: feeUsd,
+                feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
                 estimatedTimeSeconds: timeEstimate,
                 route: `${srcSymbol} → Relay → ${dstSymbol}`,
                 quoteData: data,

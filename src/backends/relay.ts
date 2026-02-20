@@ -38,6 +38,13 @@ function buildApproveData(spender: string, amount: string): string {
 
 export class RelayBackend implements BridgeBackend {
   name = "relay";
+  private appFeeRecipient?: string;
+  private appFeeBps?: string;
+
+  constructor(appFeeRecipient?: string, appFeeBps?: string) {
+    this.appFeeRecipient = appFeeRecipient;
+    this.appFeeBps = appFeeBps;
+  }
 
   async getQuote(params: QuoteParams): Promise<BridgeQuote | null> {
     try {
@@ -58,6 +65,9 @@ export class RelayBackend implements BridgeBackend {
       if (params.toAddress) {
         body.recipient = params.toAddress;
       }
+      if (this.appFeeRecipient && this.appFeeBps) {
+        body.appFees = [{ recipient: this.appFeeRecipient, fee: this.appFeeBps }];
+      }
 
       const data = await fetchJson(`${BASE_URL}/quote`, {
         method: "POST",
@@ -77,10 +87,11 @@ export class RelayBackend implements BridgeBackend {
       const timeEstimate = details.timeEstimate ?? 60;
 
       return {
-        provider: "relay",
+        provider: "Relay (direct)",
         outputAmount: formatTokenAmount(outputRaw, outputDecimals),
         outputAmountRaw: outputRaw,
         estimatedFeeUsd: feeUsd,
+        feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
         estimatedTimeSeconds: timeEstimate,
         route: `${srcSymbol} → Relay → ${dstSymbol}`,
         quoteData: data,
