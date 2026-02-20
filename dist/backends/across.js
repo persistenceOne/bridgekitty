@@ -41,6 +41,11 @@ export class AcrossBackend {
     }
     async getQuote(params) {
         try {
+            // Across only supports same-token bridging (e.g. USDC→USDC across chains).
+            // Skip cross-token swaps — those should go through aggregators like LI.FI.
+            if (params.fromTokenAddress.toLowerCase() !== params.toTokenAddress.toLowerCase()) {
+                return null;
+            }
             // Across uses suggested-fees to get the fee structure for a route
             const url = new URL(`${BASE_URL}/suggested-fees`);
             url.searchParams.set("originChainId", String(params.fromChainId));
@@ -59,8 +64,7 @@ export class AcrossBackend {
             if (outputBig <= 0n)
                 return null;
             const outputRaw = outputBig.toString();
-            // Infer decimals from the token: if raw amount > 1e15 it's likely 18 decimals, else 6
-            const decimals = params.amountRaw.length > 15 ? 18 : 6;
+            const decimals = params.fromTokenDecimals ?? 18;
             const feeUsd = Number(data.totalRelayFee.total ?? "0") / Math.pow(10, decimals);
             const estimatedFillTime = data.estimatedFillTimeSec ?? 120;
             return {

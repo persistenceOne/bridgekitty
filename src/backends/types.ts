@@ -7,6 +7,8 @@ export interface QuoteParams {
   fromAddress: string;
   toAddress?: string;
   preference: "cheapest" | "fastest";
+  fromTokenDecimals?: number;
+  toTokenDecimals?: number;
 }
 
 export interface FeeBreakdown {

@@ -70,6 +70,8 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
       // Parse amount
       const amountRaw = parseTokenAmount(params.amount, decimals);
 
+      const toDecimals = toTokenResolved?.decimals ?? 18;
+
       const quotes = await engine.getQuotes({
         fromChainId,
         toChainId,
@@ -79,6 +81,8 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         fromAddress: params.fromAddress,
         toAddress: params.toAddress,
         preference: params.preference,
+        fromTokenDecimals: decimals,
+        toTokenDecimals: toDecimals,
       });
 
       if (quotes.length === 0) {

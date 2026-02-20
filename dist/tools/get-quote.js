@@ -55,6 +55,7 @@ export function registerGetQuote(server, engine) {
         const decimals = fromTokenResolved?.decimals ?? 18;
         // Parse amount
         const amountRaw = parseTokenAmount(params.amount, decimals);
+        const toDecimals = toTokenResolved?.decimals ?? 18;
         const quotes = await engine.getQuotes({
             fromChainId,
             toChainId,
@@ -64,6 +65,8 @@ export function registerGetQuote(server, engine) {
             fromAddress: params.fromAddress,
             toAddress: params.toAddress,
             preference: params.preference,
+            fromTokenDecimals: decimals,
+            toTokenDecimals: toDecimals,
         });
         if (quotes.length === 0) {
             return {
