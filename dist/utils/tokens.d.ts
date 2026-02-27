@@ -1,10 +1,14 @@
-export interface TokenEntry {
-    symbol: string;
-    name: string;
-    decimals: number;
-    addresses: Record<number, string>;
-}
-export declare const COMMON_TOKENS: TokenEntry[];
+export { resolveToken, lookupByAddress, type TokenResolveResult } from "./token-registry.js";
+/**
+ * Resolve a token symbol or address to { address, decimals }.
+ *
+ * Returns null if:
+ * - Symbol is unknown in the verified registry for this chain
+ * - Address is already a 0x address (still returns result with known/default decimals)
+ *
+ * @deprecated Use `resolveToken()` for better error messages.
+ *   This function is kept for backward compatibility.
+ */
 export declare function resolveTokenAddress(symbol: string, chainId: number): {
     address: string;
     decimals: number;

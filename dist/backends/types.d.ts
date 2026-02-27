@@ -1,3 +1,11 @@
+/**
+ * Generic validation error that any backend can throw.
+ * Routing engine catches these and propagates them to the tool layer
+ * with user-friendly messages.
+ */
+export declare class BackendValidationError extends Error {
+    constructor(message: string);
+}
 export interface QuoteParams {
     fromChainId: number;
     toChainId: number;
@@ -11,17 +19,29 @@ export interface QuoteParams {
     toTokenDecimals?: number;
 }
 export interface FeeBreakdown {
-    gasCostUsd: number;
+    gasCostUsd: number | null;
     protocolFeeUsd: number;
     integratorFeeUsd: number;
     integratorFeePercent: string | null;
-    totalFeeUsd: number;
+    totalFeeUsd: number | null;
 }
 export interface BridgeQuote {
+    /** Machine-readable backend name (e.g. "lifi", "debridge") for routing/lookup */
+    backendName: string;
+    /** Human-readable provider description (e.g. "Stargate via LI.FI") */
     provider: string;
     outputAmount: string;
     outputAmountRaw: string;
-    estimatedFeeUsd: number;
+    /** Minimum guaranteed output (after slippage/fees). Worst-case amount that lands in wallet. */
+    minOutputAmount: string;
+    minOutputAmountRaw: string;
+    /** Number of decimals for the output token. Used to normalize cross-backend comparisons. */
+    outputDecimals?: number;
+    /** Estimated gas cost in USD for the on-chain transaction. null = unknown. */
+    estimatedGasCostUsd: number | null;
+    /** True if fallback (hardcoded) prices were used for gas estimation instead of live data */
+    usingFallbackPrices?: boolean;
+    estimatedFeeUsd: number | null;
     feeBreakdown: FeeBreakdown;
     estimatedTimeSeconds: number;
     route: string;
@@ -42,6 +62,8 @@ export interface TransactionRequest {
     };
     provider: string;
     trackingId: string;
+    /** If true, caller must re-fetch bridge tx after approval confirms (avoids stale nonce). */
+    needsPostApprovalBuild?: boolean;
 }
 export interface BridgeStatus {
     state: "pending" | "in_progress" | "completed" | "failed" | "refunded" | "unknown";

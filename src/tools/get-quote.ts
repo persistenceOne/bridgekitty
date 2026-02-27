@@ -2,12 +2,60 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
 import { resolveChainId, getChainName } from "../utils/chains.js";
-import { resolveTokenAddress, parseTokenAmount } from "../utils/tokens.js";
+import { resolveToken } from "../utils/token-registry.js";
+import { parseTokenAmount } from "../utils/tokens.js";
+import { BackendValidationError } from "../backends/types.js";
+
+// ─── Rate Limiting ─────────────────────────────────────────────────────
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 10; // max requests per route per window
+
+// Map of route key → array of request timestamps
+const rateLimitMap = new Map<string, number[]>();
+let rateLimitCheckCount = 0;
+
+/**
+ * Evict stale entries from the rate limit map to prevent unbounded growth.
+ * (NEW-MEDIUM-002: periodic cleanup every 100 calls)
+ */
+function evictStaleRateLimitEntries(): void {
+  const now = Date.now();
+  for (const [key, timestamps] of rateLimitMap) {
+    const hasRecent = timestamps.some(t => now - t < RATE_LIMIT_WINDOW_MS);
+    if (!hasRecent) {
+      rateLimitMap.delete(key);
+    }
+  }
+}
+
+function checkRateLimit(routeKey: string): boolean {
+  const now = Date.now();
+
+  // Periodic cleanup to bound memory (NEW-MEDIUM-002)
+  rateLimitCheckCount++;
+  if (rateLimitCheckCount % 100 === 0) {
+    evictStaleRateLimitEntries();
+  }
+
+  const timestamps = rateLimitMap.get(routeKey) ?? [];
+  // Prune expired entries
+  const recent = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
+    rateLimitMap.set(routeKey, recent);
+    return false; // rate limited
+  }
+  recent.push(now);
+  rateLimitMap.set(routeKey, recent);
+  return true; // allowed
+}
 
 export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
   server.tool(
     "bridge_get_quote",
-    "Get the best cross-chain bridge quote across multiple protocols (LI.FI, Persistence). Returns ranked options by output amount, speed, and fees.",
+    "Get the best cross-chain bridge quote across multiple protocols (LI.FI, Persistence). " +
+    "Accepts token symbols (e.g. 'USDC', 'ETH', 'WBTC') or contract addresses (0x...). " +
+    "Symbols are resolved to verified canonical addresses only — no unverified tokens. " +
+    "Returns ranked options by output amount, speed, and fees.",
     {
       fromChain: z
         .string()
@@ -18,11 +66,15 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
       fromToken: z
         .string()
         .describe(
-          "Token to send (symbol like 'USDC', 'ETH' or contract address)"
+          "Token to send — symbol (e.g. 'USDC', 'ETH', 'WBTC') or contract address (0x...). " +
+          "Symbols resolve to verified canonical addresses only."
         ),
       toToken: z
         .string()
-        .describe("Token to receive (symbol like 'USDC' or contract address)"),
+        .describe(
+          "Token to receive — symbol (e.g. 'USDC', 'ETH') or contract address (0x...). " +
+          "Symbols resolve to verified canonical addresses only."
+        ),
       amount: z
         .string()
         .describe("Amount in human-readable units (e.g. '100' for 100 USDC)"),
@@ -59,99 +111,214 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           ],
         };
 
-      // Resolve tokens
-      const fromTokenResolved = resolveTokenAddress(params.fromToken, fromChainId);
-      const toTokenResolved = resolveTokenAddress(params.toToken, toChainId);
+      // Rate limit check per route
+      const routeKey = `${fromChainId}:${toChainId}:${params.fromToken.toLowerCase()}:${params.toToken.toLowerCase()}`;
+      if (!checkRateLimit(routeKey)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Rate limited",
+              message: `Too many requests for this route. Maximum ${RATE_LIMIT_MAX_REQUESTS} requests per minute. Please wait and try again.`,
+            }),
+          }],
+          isError: true,
+        };
+      }
 
-      const fromTokenAddress = fromTokenResolved?.address ?? params.fromToken;
-      const toTokenAddress = toTokenResolved?.address ?? params.toToken;
-      const decimals = fromTokenResolved?.decimals ?? 18;
+      // Validate amount is positive before parsing
+      const amountTrimmed = params.amount.trim();
+      if (!amountTrimmed || !/^\d+\.?\d*$/.test(amountTrimmed)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Invalid amount",
+              message: `Amount must be a positive number. Got: "${params.amount}"`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+      const amountNum = Number(amountTrimmed);
+      if (isNaN(amountNum) || amountNum <= 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Invalid amount",
+              message: `Amount must be a positive number. Got: "${params.amount}"`,
+            }),
+          }],
+          isError: true,
+        };
+      }
 
-      // Parse amount
-      const amountRaw = parseTokenAmount(params.amount, decimals);
+      // Resolve tokens via verified registry
+      const fromTokenResult = resolveToken(params.fromToken, fromChainId);
+      if (!fromTokenResult.ok) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Token resolution failed",
+              token: params.fromToken,
+              chain: getChainName(fromChainId),
+              chainId: fromChainId,
+              message: fromTokenResult.error,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
 
-      const toDecimals = toTokenResolved?.decimals ?? 18;
+      const toTokenResult = resolveToken(params.toToken, toChainId);
+      if (!toTokenResult.ok) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Token resolution failed",
+              token: params.toToken,
+              chain: getChainName(toChainId),
+              chainId: toChainId,
+              message: toTokenResult.error,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
 
-      const quotes = await engine.getQuotes({
-        fromChainId,
-        toChainId,
-        fromTokenAddress,
-        toTokenAddress,
-        amountRaw,
-        fromAddress: params.fromAddress,
-        toAddress: params.toAddress,
-        preference: params.preference,
-        fromTokenDecimals: decimals,
-        toTokenDecimals: toDecimals,
-      });
+      const fromTokenAddress = fromTokenResult.address;
+      const toTokenAddress = toTokenResult.address;
+      const decimals = fromTokenResult.decimals;
+      const toDecimals = toTokenResult.decimals;
+      const fromSymbol = fromTokenResult.symbol;
+      const toSymbol = toTokenResult.symbol;
+
+      // Parse amount to raw units
+      const amountRaw = parseTokenAmount(amountTrimmed, decimals);
+
+      let quotes: Awaited<ReturnType<typeof engine.getQuotes>>;
+      try {
+        quotes = await engine.getQuotes({
+          fromChainId,
+          toChainId,
+          fromTokenAddress,
+          toTokenAddress,
+          amountRaw,
+          fromAddress: params.fromAddress,
+          toAddress: params.toAddress,
+          preference: params.preference,
+          fromTokenDecimals: decimals,
+          toTokenDecimals: toDecimals,
+        });
+      } catch (err) {
+        if (err instanceof BackendValidationError) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: "Validation error", message: err.message }),
+            }],
+            isError: true,
+          };
+        }
+        throw err;
+      }
 
       if (quotes.length === 0) {
+        // Differentiate "route doesn't exist" from "backends are down"
+        const diagnosis = engine.getLastRequestDiagnosis();
+        let message: string;
+        if (diagnosis.allErrored) {
+          message = `All bridge providers are currently unavailable. Please try again in a few minutes.`;
+          if (diagnosis.circuitBroken.length > 0) {
+            message += ` (${diagnosis.circuitBroken.join(", ")} temporarily disabled due to repeated failures)`;
+          }
+        } else {
+          message = `No bridge routes found for ${params.amount} ${fromSymbol} from ${getChainName(fromChainId)} to ${getChainName(toChainId)}. This route may not be supported by any provider.`;
+        }
         return {
           content: [
             {
               type: "text" as const,
-              text: `No bridge routes found for ${params.amount} ${params.fromToken} from ${getChainName(fromChainId)} to ${getChainName(toChainId)}. The route may not be supported, or all providers timed out.`,
+              text: message,
             },
           ],
         };
       }
 
-      // Determine fastest and best-rate quotes
-      const fastestTime = Math.min(...quotes.map((q) => q.estimatedTimeSeconds));
-      let bestOutputRaw = quotes[0].outputAmountRaw;
+      const best = quotes[0];
+
+      function formatTime(seconds: number): string {
+        if (seconds < 60) return `${seconds}s`;
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+      }
+
+      // Backends where gas is estimated by us (not provided by the backend API)
+      const GAS_ESTIMATED_BACKENDS = new Set(["debridge", "across", "persistence"]);
+
+      // Compute stats for tags
+      const fastestTime = Math.min(...quotes.map(q => q.estimatedTimeSeconds));
+      let bestOutputRaw = "0";
       for (const q of quotes) {
         try {
-          if (BigInt(q.outputAmountRaw) > BigInt(bestOutputRaw)) {
-            bestOutputRaw = q.outputAmountRaw;
+          if (BigInt(q.minOutputAmountRaw) > BigInt(bestOutputRaw)) {
+            bestOutputRaw = q.minOutputAmountRaw;
           }
-        } catch {}
+        } catch { /* skip */ }
       }
 
-      function tagsFor(q: typeof quotes[number]): string[] {
-        const t: string[] = [];
-        if (q.estimatedTimeSeconds === fastestTime) t.push("⚡ fastest");
-        try {
-          if (BigInt(q.outputAmountRaw) === BigInt(bestOutputRaw)) t.push("💰 best rate");
-        } catch {}
-        return t;
+      function formatGasFee(q: typeof quotes[number]): string {
+        // If gas cost is null/unknown, display "unknown" — never show misleading $0.00
+        if (q.estimatedGasCostUsd === null || q.estimatedGasCostUsd === undefined) {
+          return "unknown";
+        }
+        if (q.estimatedGasCostUsd > 0) {
+          // Backends where we estimate gas ourselves get the "~" and "(est)" markers
+          if (GAS_ESTIMATED_BACKENDS.has(q.backendName)) {
+            return `~$${q.estimatedGasCostUsd.toFixed(2)} (est)`;
+          }
+          return `$${q.estimatedGasCostUsd.toFixed(2)}`;
+        }
+        return "$0.00";
       }
 
-      const best = quotes[0];
-      const bestTags = tagsFor(best);
-      const tagStr = bestTags.length > 0 ? " " + bestTags.map((t) => t.replace(/^(⚡|💰) .*/, "$1")).join("") : "";
+      function buildTags(q: typeof quotes[number]): string[] {
+        const tags: string[] = [];
+        if (quotes.length > 1) {
+          if (q.estimatedTimeSeconds === fastestTime) {
+            tags.push("⚡ fastest");
+          }
+          try {
+            if (BigInt(q.minOutputAmountRaw) === BigInt(bestOutputRaw)) {
+              tags.push("💰 best rate");
+            }
+          } catch { /* skip */ }
+        }
+        return tags;
+      }
 
       function formatQuote(q: typeof quotes[number]) {
-        const base: Record<string, any> = {
+        return {
           provider: q.provider,
-          outputAmount: q.outputAmount,
-          estimatedTimeSeconds: q.estimatedTimeSeconds,
+          youReceiveMin: `${q.minOutputAmount} ${toSymbol}`,
+          estimatedGasFee: formatGasFee(q),
+          estimatedTime: formatTime(q.estimatedTimeSeconds),
           route: q.route,
+          tags: buildTags(q),
           quoteId: q.quoteId,
-          tags: tagsFor(q),
-          fees: {
-            totalUsd: `$${q.estimatedFeeUsd.toFixed(2)}`,
-            breakdown: {
-              gasCost: `$${q.feeBreakdown.gasCostUsd.toFixed(2)}`,
-              protocolFee: `$${q.feeBreakdown.protocolFeeUsd.toFixed(2)}`,
-              integratorFee: q.feeBreakdown.integratorFeeUsd > 0
-                ? `$${q.feeBreakdown.integratorFeeUsd.toFixed(2)}${q.feeBreakdown.integratorFeePercent ? ` (${q.feeBreakdown.integratorFeePercent})` : ""}`
-                : "none",
-            },
-          },
         };
-        return base;
       }
 
-      const integratorNote = best.feeBreakdown.integratorFeePercent
-        ? `Includes ${best.feeBreakdown.integratorFeePercent} integrator fee. Configure via LIFI_FEE env var (0-0.04).`
-        : undefined;
-
+      const bestGasDisplay = formatGasFee(best);
       const response = {
         bestQuote: formatQuote(best),
         alternatives: quotes.slice(1, 5).map(formatQuote),
         totalRoutesFound: quotes.length,
-        summary: `Best: ${best.outputAmount} ${params.toToken} via ${best.provider}${tagStr} (fee: ~$${best.estimatedFeeUsd.toFixed(2)}, ETA: ${best.estimatedTimeSeconds}s). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
-        ...(integratorNote ? { integratorFeeNote: integratorNote } : {}),
+        summary: `Best: receive min ${best.minOutputAmount} ${toSymbol} via ${best.provider} (gas: ${bestGasDisplay}, ETA: ${formatTime(best.estimatedTimeSeconds)}). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
       };
 
       return {

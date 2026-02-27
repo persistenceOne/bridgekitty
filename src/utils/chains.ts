@@ -19,15 +19,12 @@ const CHAINS: ChainEntry[] = [
   { id: 81457, name: "Blast", key: "blast" },
   { id: 7777777, name: "Zora", key: "zora" },
   { id: 34443, name: "Mode", key: "mode" },
-  { id: 1151111081099710, name: "Solana", key: "solana" },
+  // Solana support planned for v2 — requires non-EVM address handling,
+  // Solana-specific transaction building, and wallet adapter integration.
 ];
 
-// Backend-specific chain ID overrides (Solana has different IDs per provider)
-const CHAIN_ID_OVERRIDES: Record<string, Record<number, number>> = {
-  debridge: {
-    1151111081099710: 7565164, // deBridge uses 7565164 for Solana
-  },
-};
+// Backend-specific chain ID overrides (reserved for future non-EVM chain support)
+const CHAIN_ID_OVERRIDES: Record<string, Record<number, number>> = {};
 
 export function getBackendChainId(backendName: string, chainId: number): number {
   const key = backendName.toLowerCase().replace(/\s*\(.*\)/, "");
@@ -35,9 +32,12 @@ export function getBackendChainId(backendName: string, chainId: number): number 
 }
 
 export function resolveChainId(input: string): number | null {
-  // Accept any positive integer chain ID (not just hardcoded ones)
+  // Try numeric: only accept chain IDs that are in the known CHAINS array (V3-LOW-003)
   const num = Number(input);
-  if (!isNaN(num) && Number.isInteger(num) && num > 0) return num;
+  if (!isNaN(num) && Number.isInteger(num) && num > 0) {
+    const known = CHAINS.find((c) => c.id === num);
+    return known ? known.id : null;
+  }
   const lower = input.toLowerCase().trim();
   const match = CHAINS.find((c) => c.key === lower || c.name.toLowerCase() === lower);
   return match?.id ?? null;

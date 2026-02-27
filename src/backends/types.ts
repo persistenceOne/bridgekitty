@@ -1,3 +1,15 @@
+/**
+ * Generic validation error that any backend can throw.
+ * Routing engine catches these and propagates them to the tool layer
+ * with user-friendly messages.
+ */
+export class BackendValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BackendValidationError";
+  }
+}
+
 export interface QuoteParams {
   fromChainId: number;
   toChainId: number;
@@ -12,18 +24,30 @@ export interface QuoteParams {
 }
 
 export interface FeeBreakdown {
-  gasCostUsd: number;
+  gasCostUsd: number | null; // null = unknown/can't estimate
   protocolFeeUsd: number;
   integratorFeeUsd: number;
   integratorFeePercent: string | null; // e.g. "0.3%" or null if none
-  totalFeeUsd: number;
+  totalFeeUsd: number | null; // null if gas is unknown
 }
 
 export interface BridgeQuote {
+  /** Machine-readable backend name (e.g. "lifi", "debridge") for routing/lookup */
+  backendName: string;
+  /** Human-readable provider description (e.g. "Stargate via LI.FI") */
   provider: string;
   outputAmount: string;
   outputAmountRaw: string;
-  estimatedFeeUsd: number;
+  /** Minimum guaranteed output (after slippage/fees). Worst-case amount that lands in wallet. */
+  minOutputAmount: string;
+  minOutputAmountRaw: string;
+  /** Number of decimals for the output token. Used to normalize cross-backend comparisons. */
+  outputDecimals?: number;
+  /** Estimated gas cost in USD for the on-chain transaction. null = unknown. */
+  estimatedGasCostUsd: number | null;
+  /** True if fallback (hardcoded) prices were used for gas estimation instead of live data */
+  usingFallbackPrices?: boolean;
+  estimatedFeeUsd: number | null;
   feeBreakdown: FeeBreakdown;
   estimatedTimeSeconds: number;
   route: string;
@@ -40,6 +64,8 @@ export interface TransactionRequest {
   approvalTx?: { to: string; data: string; value: string; chainId: number };
   provider: string;
   trackingId: string;
+  /** If true, caller must re-fetch bridge tx after approval confirms (avoids stale nonce). */
+  needsPostApprovalBuild?: boolean;
 }
 
 export interface BridgeStatus {

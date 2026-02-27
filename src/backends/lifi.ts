@@ -9,6 +9,7 @@ import type {
   TransactionRequest,
 } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
+import { buildApproveData } from "../utils/evm.js";
 
 const BASE_URL = "https://li.quest/v1";
 const TIMEOUT_MS = 15_000;
@@ -78,11 +79,27 @@ export class LiFiBackend implements BridgeBackend {
         if (this.integratorFee) body.options.fee = parseFloat(this.integratorFee);
       }
 
-      const data = await fetchJson(`${BASE_URL}/advanced/routes`, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      let data: any;
+      try {
+        data = await fetchJson(`${BASE_URL}/advanced/routes`, {
+          method: "POST",
+          headers: { ...this.headers(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        // If fee param caused the error, retry without it
+        if (this.integratorFee && body.options?.fee !== undefined) {
+          console.warn("[lifi] quote failed with integrator fee, retrying without fee:", (err as Error).message);
+          delete body.options.fee;
+          data = await fetchJson(`${BASE_URL}/advanced/routes`, {
+            method: "POST",
+            headers: { ...this.headers(), "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+        } else {
+          throw err;
+        }
+      }
 
       const routes: any[] = data.routes ?? [];
       if (routes.length === 0) return [];
@@ -134,19 +151,29 @@ export class LiFiBackend implements BridgeBackend {
         const toSymbol = lastStep?.action?.toToken?.symbol ?? "?";
         const toDecimals = lastStep?.action?.toToken?.decimals ?? 18;
 
+        // Extract minimum output amount (after slippage)
+        // LI.FI provides toAmountMin at the route level
+        const minOutputRaw = route.toAmountMin ?? route.toAmount ?? "0";
+
         return {
+          backendName: "lifi",
           provider: `${toolNames} via LI.FI`,
           outputAmount: route.toAmount
             ? formatTokenAmount(route.toAmount, toDecimals)
             : "0",
           outputAmountRaw: route.toAmount ?? "0",
+          minOutputAmount: formatTokenAmount(minOutputRaw, toDecimals),
+          minOutputAmountRaw: minOutputRaw,
+          outputDecimals: toDecimals,
+          estimatedGasCostUsd: Math.round(gasCostUsd * 100) / 100,
           estimatedFeeUsd: totalFeeUsd,
           feeBreakdown,
           estimatedTimeSeconds:
             steps.reduce((sum: number, s: any) => sum + (s.estimate?.executionDuration ?? 0), 0) || 300,
           route: `${fromSymbol} → ${toolNames} → ${toSymbol}`,
           quoteData: route,
-          expiresAt: Date.now() + 60_000,
+          // LI.FI quotes are volatile (DEX prices shift rapidly) — use 30s expiry
+          expiresAt: Date.now() + 30_000,
         } satisfies BridgeQuote;
       });
     } catch (err) {
@@ -190,9 +217,24 @@ export class LiFiBackend implements BridgeBackend {
       const tokenAddr = action.fromToken.address;
       // Non-native tokens may need approval
       if (tokenAddr !== "0x0000000000000000000000000000000000000000") {
+        // MEDIUM-001: Sanity-check approval amount against quoted input
+        let approvalAmount = action.fromAmount;
+        const quotedInput = route.steps?.[0]?.action?.fromAmount ?? route.fromAmount;
+        if (quotedInput && approvalAmount) {
+          const approvalBn = BigInt(approvalAmount);
+          const quotedBn = BigInt(quotedInput);
+          const maxAllowed = (quotedBn * 110n) / 100n; // 110% of quoted
+          if (approvalBn > maxAllowed) {
+            console.warn(
+              `[lifi] Approval amount ${approvalAmount} exceeds 110% of quoted input ${quotedInput}. Capping to ${maxAllowed.toString()}.`,
+            );
+            approvalAmount = maxAllowed.toString();
+          }
+        }
+
         result.approvalTx = {
           to: tokenAddr,
-          data: buildApproveData(estimate.approvalAddress, action.fromAmount),
+          data: buildApproveData(estimate.approvalAddress, approvalAmount),
           value: "0x0",
           chainId: txReq.chainId,
         };
@@ -285,9 +327,4 @@ export class LiFiBackend implements BridgeBackend {
   }
 }
 
-function buildApproveData(spender: string, amount: string): string {
-  // ERC20 approve(address,uint256) selector = 0x095ea7b3
-  const spenderPadded = spender.toLowerCase().replace("0x", "").padStart(64, "0");
-  const amountHex = BigInt(amount).toString(16).padStart(64, "0");
-  return `0x095ea7b3${spenderPadded}${amountHex}`;
-}
+// buildApproveData imported from ../utils/evm.js

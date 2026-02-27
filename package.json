@@ -1,25 +1,71 @@
 {
   "name": "bridgekitty",
   "version": "0.1.0",
-  "description": "BridgeKitty 🐱 — Cross-chain bridge aggregator for AI agents. One tool, all bridges, best routes.",
+  "description": "BridgeKitty 🐱 — Cross-chain bridge aggregator MCP server for AI agents. One tool, all bridges, best routes.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "bridgekitty": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "start:acp": "node --env-file=.env.acp dist/index.js --acp",
+    "dev": "tsx src/index.ts",
+    "dev:acp": "tsx --env-file=.env.acp src/index.ts --acp",
+    "register": "tsx --env-file=.env.acp src/index.ts --register",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "bridge",
+    "cross-chain",
+    "defi",
+    "ai-agent",
+    "lifi",
+    "debridge",
+    "across",
+    "relay",
+    "evm",
+    "ethereum",
+    "arbitrum",
+    "optimism",
+    "base"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/bridgekitty"
   },
   "dependencies": {
+    "@cosmjs/amino": "^0.38.1",
+    "@cosmjs/crypto": "^0.38.1",
+    "@cosmjs/proto-signing": "^0.38.1",
+    "@cosmjs/stargate": "^0.38.1",
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@scure/bip39": "^2.0.1",
+    "@solana/web3.js": "^1.98.0",
+    "@virtuals-protocol/acp-node": "^0.3.0-beta.34",
+    "bs58": "^6.0.0",
+    "ed25519-hd-key": "^1.3.0",
+    "ethers": "^6.16.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "license": "MIT"
 }

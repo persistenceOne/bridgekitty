@@ -9,6 +9,8 @@ import type {
 } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
 import { getAllChains } from "../utils/chains.js";
+import { buildApproveData, NATIVE_ADDRESS } from "../utils/evm.js";
+import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 
 const BASE_URL = "https://api.relay.link";
 const TIMEOUT_MS = 15_000;
@@ -28,13 +30,7 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   }
 }
 
-const NATIVE = "0x0000000000000000000000000000000000000000";
-
-function buildApproveData(spender: string, amount: string): string {
-  const spenderPadded = spender.toLowerCase().replace("0x", "").padStart(64, "0");
-  const amountHex = BigInt(amount).toString(16).padStart(64, "0");
-  return `0x095ea7b3${spenderPadded}${amountHex}`;
-}
+// buildApproveData imported from ../utils/evm.js
 
 export class RelayBackend implements BridgeBackend {
   name = "relay";
@@ -52,11 +48,11 @@ export class RelayBackend implements BridgeBackend {
         user: params.fromAddress,
         originChainId: params.fromChainId,
         destinationChainId: params.toChainId,
-        originCurrency: params.fromTokenAddress === NATIVE
-          ? "0x0000000000000000000000000000000000000000"
+        originCurrency: params.fromTokenAddress === NATIVE_ADDRESS
+          ? NATIVE_ADDRESS
           : params.fromTokenAddress,
-        destinationCurrency: params.toTokenAddress === NATIVE
-          ? "0x0000000000000000000000000000000000000000"
+        destinationCurrency: params.toTokenAddress === NATIVE_ADDRESS
+          ? NATIVE_ADDRESS
           : params.toTokenAddress,
         amount: params.amountRaw,
         tradeType: "EXACT_INPUT",
@@ -84,18 +80,41 @@ export class RelayBackend implements BridgeBackend {
       const srcSymbol = details.currencyIn?.currency?.symbol ?? "?";
       const dstSymbol = details.currencyOut?.currency?.symbol ?? "?";
       const feeUsd = Number(details.totalFee?.usd ?? 0);
+      let gasFeeUsd = Number(details.gasFee?.usd ?? 0);
       const timeEstimate = details.timeEstimate ?? 60;
 
+      // Relay includes relayer gas in their fee, so API often reports 0 for gas.
+      // But the user still pays source chain gas to submit the tx — estimate it.
+      let usingFallbackPrices: boolean | undefined;
+      if (gasFeeUsd < 0.001) {
+        const gasUnits = getGasUnits("relay", params.fromChainId);
+        const gasEstimate = await estimateGasCostUsd(params.fromChainId, gasUnits);
+        if (gasEstimate !== null) {
+          gasFeeUsd = gasEstimate.costUsd;
+          usingFallbackPrices = gasEstimate.usingFallbackPrices || undefined;
+        }
+      }
+
+      // Relay is intent-based with deterministic pricing — min = estimated
       return {
+        backendName: "relay",
         provider: "Relay (direct)",
         outputAmount: formatTokenAmount(outputRaw, outputDecimals),
         outputAmountRaw: outputRaw,
-        estimatedFeeUsd: feeUsd,
-        feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
+        minOutputAmount: formatTokenAmount(outputRaw, outputDecimals),
+        minOutputAmountRaw: outputRaw,
+        outputDecimals,
+        estimatedGasCostUsd: Math.round(gasFeeUsd * 100) / 100,
+        usingFallbackPrices,
+        estimatedFeeUsd: feeUsd + gasFeeUsd,
+        feeBreakdown: { gasCostUsd: gasFeeUsd, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd + gasFeeUsd },
         estimatedTimeSeconds: timeEstimate,
         route: `${srcSymbol} → Relay → ${dstSymbol}`,
         quoteData: data,
-        expiresAt: Date.now() + 60_000,
+        // Relay quotes include step-level expiry. Use it if available, else 30s default.
+        expiresAt: data.steps?.[0]?.items?.[0]?.data?.expiresAt
+          ? new Date(data.steps[0].items[0].data.expiresAt).getTime()
+          : Date.now() + 30_000,
       };
     } catch (err) {
       console.error("[relay] quote error:", (err as Error).message);
@@ -126,7 +145,9 @@ export class RelayBackend implements BridgeBackend {
       }
     }
 
-    if (!mainTx) throw new Error("No transaction data in Relay quote steps");
+    if (!mainTx || !mainTx.to || !mainTx.data) {
+      throw new Error("No valid transaction data in Relay quote steps");
+    }
 
     const result: TransactionRequest = {
       to: mainTx.to,
@@ -155,36 +176,64 @@ export class RelayBackend implements BridgeBackend {
   ): Promise<BridgeStatus> {
     try {
       const txHash = meta?.txHash;
-      if (!txHash) {
+
+      // Extract requestId from trackingId ("relay:<requestId>")
+      const requestId = trackingId.startsWith("relay:")
+        ? trackingId.slice("relay:".length)
+        : undefined;
+
+      if (!requestId && !txHash) {
         return {
           state: "unknown",
-          humanReadable: "No transaction hash provided for Relay status check",
+          humanReadable: "No requestId or txHash for Relay status check",
           provider: "relay",
           elapsed: 0,
         };
       }
 
-      const chainId = meta?.fromChain ?? "1";
+      // Prefer requestId (reliable), fall back to txHash query
+      // Use v3 endpoint (v2 is deprecated)
+      const queryParam = requestId
+        ? `requestId=${requestId}`
+        : `txHash=${txHash}`;
 
       const data = await fetchJson(
-        `${BASE_URL}/intents/status/v2?chainId=${chainId}&txHash=${txHash}`
+        `${BASE_URL}/intents/status/v3?${queryParam}`
       );
 
+      // Relay v3 status values (from docs):
+      //   waiting   — Waiting for deposit confirmation
+      //   pending   — Deposit confirmed, pending destination chain submission
+      //   submitted — Destination transaction submitted
+      //   success   — Successful fill on destination
+      //   delayed   — Destination fill delayed, still processing
+      //   refunded  — Successfully refunded
+      //   refund    — Refund alias
+      //   failure   — Unsuccessful fill
       const stateMap: Record<string, BridgeStatus["state"]> = {
-        pending: "pending",
         waiting: "pending",
+        pending: "in_progress",
+        submitted: "in_progress",
         delayed: "in_progress",
-        receiving: "in_progress",
         success: "completed",
         failure: "failed",
         refund: "refunded",
+        refunded: "refunded",
       };
 
+      const mappedState = stateMap[data.status];
+      if (!mappedState && data.status && data.status !== "unknown") {
+        console.warn(`[relay] unmapped status: "${data.status}" — treating as pending`);
+      }
+
+      const destChainId = data.destinationChainId;
+      const sourceChainId = data.originChainId;
+
       return {
-        state: stateMap[data.status] ?? "in_progress",
+        state: mappedState ?? (data.status === "unknown" ? "unknown" : "pending"),
         humanReadable: `Relay bridge: ${data.status ?? "unknown"}`,
-        sourceTxHash: txHash,
-        destTxHash: data.txHashes?.find((t: any) => t.chainId !== Number(chainId))?.txHash,
+        sourceTxHash: txHash ?? data.inTxHashes?.[0],
+        destTxHash: data.txHashes?.[0],
         provider: "relay",
         elapsed: 0,
       };

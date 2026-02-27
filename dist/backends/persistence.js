@@ -1,6 +1,64 @@
+import { ethers } from "ethers";
+import { BackendValidationError } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
+import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+/**
+ * @deprecated Use BackendValidationError from types.ts instead.
+ * Kept as re-export for backward compatibility.
+ */
+export const PersistenceValidationError = BackendValidationError;
 const BASE_URL = "https://api.interop.persistence.one";
 const TIMEOUT_MS = 15_000;
+// Contract addresses (same on Base 8453 and BSC 56)
+const SETTLEMENT_CONTRACT = "0x5e53703b62472c336D2d7963e789b911cFafFeA7";
+const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+// ABI fragments for settlement contract
+const SETTLEMENT_ABI = [
+    "function prepareCrossChainOrder(address inputToken, uint256 inputAmount, address outputToken, uint256 outputAmount, address recipientAddress, uint32 destinationChainId, uint32 initiateDeadline, uint32 fillDeadline) external view returns (tuple(address settlementContract, address swapper, uint256 nonce, uint32 originChainId, uint32 initiateDeadline, uint32 fillDeadline, bytes orderData))",
+    "function initiate(tuple(address settlementContract, address swapper, uint256 nonce, uint32 originChainId, uint32 initiateDeadline, uint32 fillDeadline, bytes orderData) order, bytes signature, bytes fillerData) external",
+];
+const ERC20_ABI = [
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function allowance(address owner, address spender) view returns (uint256)",
+];
+// RPC endpoints
+const RPC_URLS = {
+    8453: "https://mainnet.base.org",
+    56: "https://bsc-dataseed1.binance.org",
+};
+// EIP-712 types for Permit2 witness signing
+const PERMIT2_DOMAIN = {
+    name: "Permit2",
+    chainId: 0, // set dynamically
+    verifyingContract: PERMIT2_ADDRESS,
+};
+// The witness type for CrossChainOrder
+const CROSS_CHAIN_ORDER_TYPE = {
+    CrossChainOrder: [
+        { name: "settlementContract", type: "address" },
+        { name: "swapper", type: "address" },
+        { name: "nonce", type: "uint256" },
+        { name: "originChainId", type: "uint32" },
+        { name: "initiateDeadline", type: "uint32" },
+        { name: "fillDeadline", type: "uint32" },
+        { name: "orderData", type: "bytes" },
+    ],
+};
+// Full Permit2 PermitTransferFrom + witness types
+const PERMIT2_WITNESS_TYPES = {
+    PermitWitnessTransferFrom: [
+        { name: "permitted", type: "TokenPermissions" },
+        { name: "spender", type: "address" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+        { name: "witness", type: "CrossChainOrder" },
+    ],
+    TokenPermissions: [
+        { name: "token", type: "address" },
+        { name: "amount", type: "uint256" },
+    ],
+    ...CROSS_CHAIN_ORDER_TYPE,
+};
 async function fetchJson(url, init) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -21,6 +79,10 @@ const SUPPORTED_CHAINS = [
     { id: 8453, name: "Base", key: "base" },
     { id: 56, name: "BNB Chain", key: "bsc" },
 ];
+// Amount caps in raw units (8-decimal BTC): 0.00005–0.001 BTC = 5000–100000
+const MIN_AMOUNT_RAW = 5000n;
+const MAX_AMOUNT_RAW = 100000n;
+const MAX_QUOTES_RETURNED = 10;
 // Supported BTC token addresses
 const BTC_TOKENS = {
     8453: { address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", symbol: "cbBTC" },
@@ -28,6 +90,34 @@ const BTC_TOKENS = {
 };
 export class PersistenceBackend {
     name = "persistence";
+    /**
+     * Validate amount against Persistence Interop caps.
+     * Caps are defined in 8-decimal BTC units (MIN_AMOUNT_RAW=5000, MAX_AMOUNT_RAW=100000).
+     * BTCB uses 18 decimals, cbBTC uses 8 decimals — normalize before comparing.
+     */
+    validateAmount(amountRaw, fromChainId) {
+        let amt;
+        try {
+            amt = BigInt(amountRaw);
+        }
+        catch {
+            throw new BackendValidationError(`Invalid amount: "${amountRaw}" is not a valid number`);
+        }
+        if (amt <= 0n) {
+            throw new BackendValidationError(`Amount must be positive. Got: ${amountRaw}`);
+        }
+        // Normalize to 8-decimal BTC for cap comparison
+        // BTCB (BSC, chain 56) = 18 decimals, cbBTC (Base, chain 8453) = 8 decimals
+        const fromToken = BTC_TOKENS[fromChainId];
+        const fromDecimals = fromToken?.symbol === "BTCB" ? 18 : 8;
+        const normalized = fromDecimals > 8 ? amt / (10n ** BigInt(fromDecimals - 8)) : amt;
+        if (normalized < MIN_AMOUNT_RAW) {
+            throw new BackendValidationError(`Amount too small (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Minimum is 0.00005 BTC.`);
+        }
+        if (normalized > MAX_AMOUNT_RAW) {
+            throw new BackendValidationError(`Amount too large (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Maximum is 0.001 BTC.`);
+        }
+    }
     async getQuote(params) {
         try {
             // Only support BTC cross-chain between Base and BSC
@@ -47,6 +137,8 @@ export class PersistenceBackend {
                 toAddr !== toBtc.symbol.toLowerCase()) {
                 return null;
             }
+            // BUG-001 & BUG-002: Validate amount caps and reject zero/negative
+            this.validateAmount(params.amountRaw, params.fromChainId);
             const data = await fetchJson(`${BASE_URL}/quotes/request`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -59,68 +151,354 @@ export class PersistenceBackend {
                 }),
             });
             // API returns {quotes: [...]} or an array
-            const quotes = Array.isArray(data) ? data : (data.quotes ?? [data]);
-            if (!quotes.length || quotes[0]?.error)
+            const allQuotes = Array.isArray(data) ? data : (data.quotes ?? [data]);
+            if (!allQuotes.length || allQuotes[0]?.error)
                 return null;
-            const best = quotes.reduce((a, b) => BigInt(b.estimatedDestinationAmount ?? "0") > BigInt(a.estimatedDestinationAmount ?? "0") ? b : a);
-            const dstDecimals = toBtc.symbol === "BTCB" ? 18 : 8; // BTCB is 18 decimals on BSC
+            // Filter out expired quotes (OBSERVATION-001 & OBSERVATION-002)
+            const now = Date.now();
+            const validQuotes = allQuotes.filter((q) => {
+                if (!q.expirationTime)
+                    return true;
+                const expiry = new Date(q.expirationTime).getTime();
+                return expiry > now;
+            });
+            if (!validQuotes.length)
+                return null;
+            // Sort by best output and take top N (OBSERVATION-001: reduce 300+ to best 10)
+            validQuotes.sort((a, b) => {
+                try {
+                    const diff = BigInt(b.estimatedDestinationAmount ?? "0") - BigInt(a.estimatedDestinationAmount ?? "0");
+                    return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+                }
+                catch {
+                    return 0;
+                }
+            });
+            const topQuotes = validQuotes.slice(0, Number(MAX_QUOTES_RETURNED));
+            const best = topQuotes[0];
+            const dstDecimals = toBtc.symbol === "BTCB" ? 18 : 8;
             const outputRaw = best.estimatedDestinationAmount ?? "0";
-            const totalFeeBps = Number(best.totalFee ?? 0);
-            // Fee is in basis units of the source token
-            const feeUsd = 0; // Hard to convert to USD without price; leave 0 for now
+            const feeUsd = 0;
+            // Estimate source chain gas cost (chain-aware)
+            const gasUnits = getGasUnits("persistence", params.fromChainId);
+            const gasEstimate = await estimateGasCostUsd(params.fromChainId, gasUnits);
+            const gasCostUsd = gasEstimate?.costUsd ?? null;
+            // Solver-based: apply 0.5% slippage for min output
+            let minOutputRaw;
+            try {
+                const outputBig = BigInt(outputRaw);
+                minOutputRaw = (outputBig * 995n / 1000n).toString();
+            }
+            catch {
+                minOutputRaw = outputRaw;
+            }
             return {
+                backendName: "persistence",
                 provider: "Persistence Interop (direct)",
                 outputAmount: formatTokenAmount(outputRaw, dstDecimals),
                 outputAmountRaw: outputRaw,
-                estimatedFeeUsd: feeUsd,
-                feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
-                estimatedTimeSeconds: 120,
+                minOutputAmount: formatTokenAmount(minOutputRaw, dstDecimals),
+                minOutputAmountRaw: minOutputRaw,
+                outputDecimals: dstDecimals,
+                estimatedGasCostUsd: gasCostUsd,
+                usingFallbackPrices: gasEstimate?.usingFallbackPrices,
+                estimatedFeeUsd: gasCostUsd !== null ? feeUsd + gasCostUsd : null,
+                feeBreakdown: {
+                    gasCostUsd,
+                    protocolFeeUsd: feeUsd,
+                    integratorFeeUsd: 0,
+                    integratorFeePercent: null,
+                    totalFeeUsd: gasCostUsd !== null ? feeUsd + gasCostUsd : null,
+                },
+                estimatedTimeSeconds: 10,
                 route: `${fromBtc.symbol} → Persistence Solver → ${toBtc.symbol}`,
-                quoteData: best,
+                quoteData: {
+                    ...best,
+                    // Stash params needed for buildTransaction/signAndExecute
+                    sourceChainId: params.fromChainId,
+                    destinationChainId: params.toChainId,
+                    sourceAmount: params.amountRaw,
+                },
                 expiresAt: best.expirationTime ? new Date(best.expirationTime).getTime() : Date.now() + 60_000,
+                _meta: {
+                    totalQuotesFromSolver: allQuotes.length,
+                    expiredFiltered: allQuotes.length - validQuotes.length,
+                    returnedAfterFilter: topQuotes.length,
+                },
             };
         }
         catch (err) {
+            if (err instanceof BackendValidationError) {
+                throw err; // Let validation errors propagate
+            }
             console.error("[persistence] quote error:", err.message);
             return null;
         }
     }
-    async buildTransaction(quote) {
+    /**
+     * Prepare a CrossChainOrder for signing. This calls the settlement contract
+     * on-chain to get a properly formed order with nonce and orderData.
+     */
+    async prepareOrder(quote, swapperAddress) {
         const data = quote.quoteData;
-        // The Persistence Interop flow:
-        // 1. Agent approves token spend to the escrow contract
-        // 2. Agent calls the escrow contract to lock tokens
-        // 3. Submit order to backend
-        // The exact tx data should come from the quote response
-        if (data.transactionRequest) {
-            return {
-                to: data.transactionRequest.to,
-                data: data.transactionRequest.data,
-                value: data.transactionRequest.value ?? "0x0",
-                chainId: data.transactionRequest.chainId,
-                gasLimit: data.transactionRequest.gasLimit,
-                provider: "persistence",
-                trackingId: `persistence:${data.orderId ?? Date.now()}`,
-            };
+        const sourceChainId = data.sourceChainId ?? data.chainId ?? 8453;
+        const destChainId = data.destinationChainId ?? data.destChainId ?? 56;
+        const fromBtc = BTC_TOKENS[sourceChainId];
+        const toBtc = BTC_TOKENS[destChainId];
+        if (!fromBtc || !toBtc) {
+            throw new Error(`Unsupported chain pair: ${sourceChainId} → ${destChainId}`);
         }
-        throw new Error("Persistence quote did not include transaction data. Manual order submission may be required via the Persistence Interop frontend.");
+        const rpcUrl = RPC_URLS[sourceChainId];
+        if (!rpcUrl)
+            throw new Error(`No RPC for chain ${sourceChainId}`);
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, provider);
+        const now = Math.floor(Date.now() / 1000);
+        const initiateDeadline = now + 180; // 3 minutes (H-2: tightened from 10 min)
+        const fillDeadline = now + 7200; // 2 hours
+        const inputAmount = data.sourceAmount;
+        if (!inputAmount)
+            throw new Error(`Missing sourceAmount in quote data`);
+        // MEDIUM-001: Use slippage-adjusted minOutputRaw instead of raw estimatedDestinationAmount
+        const rawOutputAmount = data.estimatedDestinationAmount ?? data.outputAmount;
+        if (!rawOutputAmount)
+            throw new Error(`Missing output amount in quote data`);
+        // Validate output is reasonable (at least 95% of input for same-asset cross-chain)
+        try {
+            const inputBig = BigInt(inputAmount);
+            const outputBig = BigInt(rawOutputAmount);
+            // Normalize to same decimals for comparison
+            const fromDecimals = BTC_TOKENS[sourceChainId]?.symbol === "BTCB" ? 18 : 8;
+            const toDecimals = BTC_TOKENS[destChainId]?.symbol === "BTCB" ? 18 : 8;
+            const normalizedInput = fromDecimals > toDecimals
+                ? inputBig / (10n ** BigInt(fromDecimals - toDecimals))
+                : inputBig * (10n ** BigInt(toDecimals - fromDecimals));
+            const minAcceptable = normalizedInput * 95n / 100n;
+            if (outputBig < minAcceptable) {
+                throw new Error(`Solver output too low: ${rawOutputAmount} is less than 95% of input (${normalizedInput.toString()}). Possible manipulation.`);
+            }
+        }
+        catch (e) {
+            if (e.message.includes("Solver output too low"))
+                throw e;
+            // If BigInt conversion fails, continue with the raw amount
+        }
+        // Use minOutputRaw (with 0.5% slippage) from the quote for on-chain order
+        const outputAmount = quote.minOutputAmountRaw ?? rawOutputAmount;
+        console.log(`[persistence] Preparing order: ${fromBtc.symbol} (${sourceChainId}) → ${toBtc.symbol} (${destChainId})`);
+        console.log(`[persistence] Input: ${inputAmount}, Output: ${outputAmount}`);
+        // Call prepareCrossChainOrder with `from` set so the contract sees msg.sender
+        // as the swapper address. This makes the contract return the correct swapper
+        // and a valid Permit2 nonce (next unused slot in the Permit2 bitmap).
+        const callData = settlement.interface.encodeFunctionData("prepareCrossChainOrder", [
+            fromBtc.address,
+            inputAmount,
+            toBtc.address,
+            outputAmount,
+            swapperAddress,
+            destChainId,
+            initiateDeadline,
+            fillDeadline,
+        ]);
+        const rawResult = await provider.call({
+            to: SETTLEMENT_CONTRACT,
+            data: callData,
+            from: swapperAddress,
+        });
+        const orderResult = settlement.interface.decodeFunctionResult("prepareCrossChainOrder", rawResult);
+        // orderResult[0] is the tuple: (settlementContract, swapper, nonce, originChainId, initiateDeadline, fillDeadline, orderData)
+        const contractOrder = orderResult[0];
+        const order = {
+            settlementContract: contractOrder.settlementContract,
+            swapper: contractOrder.swapper,
+            nonce: BigInt(contractOrder.nonce),
+            originChainId: Number(contractOrder.originChainId),
+            initiateDeadline: Number(contractOrder.initiateDeadline),
+            fillDeadline: Number(contractOrder.fillDeadline),
+            orderData: contractOrder.orderData,
+        };
+        console.log(`[persistence] Contract returned nonce: ${order.nonce}, swapper: ${order.swapper}`);
+        // Build EIP-712 typed data for Permit2 witness signing
+        const eip712Domain = {
+            ...PERMIT2_DOMAIN,
+            chainId: sourceChainId,
+        };
+        const eip712Value = {
+            permitted: {
+                token: fromBtc.address,
+                amount: inputAmount,
+            },
+            spender: SETTLEMENT_CONTRACT,
+            nonce: order.nonce,
+            deadline: BigInt(initiateDeadline),
+            witness: {
+                settlementContract: order.settlementContract,
+                swapper: order.swapper,
+                nonce: order.nonce,
+                originChainId: order.originChainId,
+                initiateDeadline: order.initiateDeadline,
+                fillDeadline: order.fillDeadline,
+                orderData: order.orderData,
+            },
+        };
+        // Build approval tx for Permit2
+        const erc20Iface = new ethers.Interface(ERC20_ABI);
+        const approvalData = erc20Iface.encodeFunctionData("approve", [
+            PERMIT2_ADDRESS,
+            inputAmount,
+        ]);
+        return {
+            order,
+            eip712Domain,
+            eip712Types: PERMIT2_WITNESS_TYPES,
+            eip712Value,
+            inputToken: fromBtc.address,
+            inputAmount,
+            approvalTx: {
+                to: fromBtc.address,
+                data: approvalData,
+                value: "0x0",
+                chainId: sourceChainId,
+            },
+        };
+    }
+    /**
+     * Build transaction data. When no signer is available (MCP flow), returns
+     * prepared order data that the caller must sign externally.
+     * Use signAndExecute() for flows where a signer is available.
+     */
+    async buildTransaction(_quote) {
+        // MEDIUM-003: Persistence requires EIP-712 signing via signAndExecute() with a signer.
+        // The MCP flow cannot support this backend for execution (only for quoting).
+        throw new Error("Persistence Interop requires EIP-712 signature-based execution via signAndExecute(). " +
+            "The MCP buildTransaction() flow cannot support this backend. " +
+            "Use the Persistence Interop frontend or an agent with signing capability.");
+    }
+    /**
+     * Full sign-and-execute flow for when a signer (private key) is available.
+     * This is used by test scripts and the ACP listener.
+     *
+     * Returns the source chain tx hash and order ID for tracking.
+     */
+    async signAndExecute(quote, signer) {
+        const data = quote.quoteData;
+        const sourceChainId = data.sourceChainId ?? data.chainId ?? 8453;
+        const rpcUrl = RPC_URLS[sourceChainId];
+        if (!rpcUrl)
+            throw new Error(`No RPC for chain ${sourceChainId}`);
+        // Ensure signer is connected to the right chain
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const connectedSigner = signer.connect(provider);
+        const swapperAddress = await connectedSigner.getAddress();
+        // Step 1: Prepare the order
+        console.log("[persistence] Step 1: Preparing cross-chain order...");
+        const prepared = await this.prepareOrder(quote, swapperAddress);
+        // Step 2: Check and set Permit2 allowance
+        console.log("[persistence] Step 2: Checking Permit2 allowance...");
+        const erc20 = new ethers.Contract(prepared.inputToken, ERC20_ABI, connectedSigner);
+        const currentAllowance = await erc20.allowance(swapperAddress, PERMIT2_ADDRESS);
+        if (currentAllowance < BigInt(prepared.inputAmount)) {
+            console.log("[persistence] Approving Permit2...");
+            const approveTx = await erc20.approve(PERMIT2_ADDRESS, prepared.inputAmount);
+            console.log(`[persistence] Approval tx: ${approveTx.hash}`);
+            await approveTx.wait();
+            console.log("[persistence] Permit2 approved.");
+        }
+        else {
+            console.log("[persistence] Permit2 already has sufficient allowance.");
+        }
+        // Step 3: Sign EIP-712 typed data
+        console.log("[persistence] Step 3: Signing EIP-712 typed data...");
+        const signature = await connectedSigner.signTypedData(prepared.eip712Domain, prepared.eip712Types, prepared.eip712Value);
+        console.log(`[persistence] Signature: ${signature.slice(0, 20)}...`);
+        // Step 4: Initiate on-chain
+        console.log("[persistence] Step 4: Initiating on-chain...");
+        const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, connectedSigner);
+        const fillerData = ethers.zeroPadValue("0x", 32);
+        const orderTuple = [
+            prepared.order.settlementContract,
+            prepared.order.swapper,
+            prepared.order.nonce,
+            prepared.order.originChainId,
+            prepared.order.initiateDeadline,
+            prepared.order.fillDeadline,
+            prepared.order.orderData,
+        ];
+        let initiateTx;
+        let receipt;
+        try {
+            initiateTx = await settlement.initiate(orderTuple, signature, fillerData);
+            console.log(`[persistence] Initiate tx: ${initiateTx.hash}`);
+            receipt = await initiateTx.wait();
+            console.log(`[persistence] Confirmed in block ${receipt?.blockNumber}`);
+        }
+        catch (initiateError) {
+            // HIGH-001 + HIGH-002: Revoke Permit2 approval on failed initiate
+            console.warn(`[persistence] initiate() failed. Revoking Permit2 ERC20 approval. ` +
+                `Note: the EIP-712 signature may be replayable until the deadline expires ` +
+                `(${prepared.order.initiateDeadline}). Deadline is limited to 10 minutes.`);
+            try {
+                const revokeTx = await erc20.approve(PERMIT2_ADDRESS, 0);
+                await revokeTx.wait();
+                console.log("[persistence] Permit2 approval revoked (set to 0).");
+            }
+            catch (revokeError) {
+                console.error(`[persistence] Failed to revoke Permit2 approval: ${revokeError.message}`);
+            }
+            throw initiateError;
+        }
+        // Step 5: Submit to backend
+        console.log("[persistence] Step 5: Submitting to backend...");
+        const orderId = data.id ?? `order-${Date.now()}`;
+        try {
+            await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    settlementContract: prepared.order.settlementContract,
+                    swapper: swapperAddress,
+                    nonce: Number(prepared.order.nonce),
+                    originChainId: sourceChainId,
+                    initiateDeadline: Number(prepared.order.initiateDeadline),
+                    fillDeadline: Number(prepared.order.fillDeadline),
+                    orderData: prepared.order.orderData,
+                    signature,
+                    sourceChainTxHash: initiateTx.hash,
+                }),
+            });
+            console.log("[persistence] Order submitted to backend.");
+        }
+        catch (err) {
+            console.warn(`[persistence] Backend submission failed (non-fatal): ${err.message}`);
+        }
+        return {
+            txHash: initiateTx.hash,
+            orderId,
+            trackingId: `persistence:${orderId}`,
+        };
     }
     async getStatus(trackingId, meta) {
         try {
             const orderId = meta?.orderId ?? trackingId.replace("persistence:", "");
-            const data = await fetchJson(`${BASE_URL}/orders/reclaim-status/${orderId}`);
+            // Use /orders/{orderId}/status for order lifecycle status
+            const data = await fetchJson(`${BASE_URL}/orders/${orderId}/status`);
+            // Map API statuses to BridgeStatus states
             const stateMap = {
-                pending: "pending",
-                filled: "completed",
-                completed: "completed",
-                failed: "failed",
-                refunded: "refunded",
+                CREATED: "pending",
+                ACCEPTED: "pending",
+                SUBMITTED_SOURCE: "in_progress",
+                USER_SUBMITTED_SOURCE: "in_progress",
+                PENDING_CONFIRMATION: "in_progress",
+                FULFILLED: "completed",
+                EXPIRED: "failed",
+                UNFULFILLED: "failed",
+                VERIFICATION_FAILED: "failed",
             };
             return {
                 state: stateMap[data.status] ?? "in_progress",
                 humanReadable: `Persistence Interop: ${data.status ?? "unknown"}`,
-                sourceTxHash: data.sourceTxHash,
-                destTxHash: data.destinationTxHash,
+                sourceTxHash: data.sourceChainTxHash,
+                destTxHash: data.destinationChainTxHash,
                 provider: "persistence",
                 elapsed: 0,
             };

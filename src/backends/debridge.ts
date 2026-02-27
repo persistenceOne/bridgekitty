@@ -8,8 +8,9 @@ import type {
   TransactionRequest,
 } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
-import { getBackendChainId } from "../utils/chains.js";
-import { getAllChains } from "../utils/chains.js";
+import { getBackendChainId, getAllChains } from "../utils/chains.js";
+import { buildApproveData } from "../utils/evm.js";
+import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 
 const BASE_URL = "https://api.dln.trade/v1.0";
 const TIMEOUT_MS = 15_000;
@@ -29,11 +30,7 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   }
 }
 
-function buildApproveData(spender: string, amount: string): string {
-  const spenderPadded = spender.toLowerCase().replace("0x", "").padStart(64, "0");
-  const amountHex = BigInt(amount).toString(16).padStart(64, "0");
-  return `0x095ea7b3${spenderPadded}${amountHex}`;
-}
+// buildApproveData imported from ../utils/evm.js
 
 export class DeBridgeBackend implements BridgeBackend {
   name = "debridge";
@@ -61,7 +58,20 @@ export class DeBridgeBackend implements BridgeBackend {
         url.searchParams.set("affiliateFeeRecipient", this.affiliateFeeRecipient);
       }
 
-      const data = await fetchJson(url.toString());
+      let data: any;
+      try {
+        data = await fetchJson(url.toString());
+      } catch (err) {
+        // If affiliate fee params caused the error, retry without them
+        if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
+          console.warn("[debridge] quote failed with affiliate fee, retrying without fee:", (err as Error).message);
+          url.searchParams.delete("affiliateFeePercent");
+          url.searchParams.delete("affiliateFeeRecipient");
+          data = await fetchJson(url.toString());
+        } else {
+          throw err;
+        }
+      }
 
       if (!data.estimation) return null;
 
@@ -70,18 +80,55 @@ export class DeBridgeBackend implements BridgeBackend {
       const srcTokenSymbol = data.estimation.srcChainTokenIn?.symbol ?? "?";
       const dstTokenSymbol = data.estimation.dstChainTokenOut?.symbol ?? "?";
 
-      // Calculate fee from operating expenses
-      const totalFeeUsd = Number(data.estimation.costsDetails?.reduce(
-        (sum: number, c: any) => sum + Number(c.payload?.feeApproximateUsdValue ?? 0),
-        0
-      ) ?? 0);
+      // Calculate fee from operating expenses (with safe parsing)
+      let totalFeeUsd = 0;
+      const costsDetails = data.estimation.costsDetails;
+      if (Array.isArray(costsDetails)) {
+        for (const c of costsDetails) {
+          const usd = Number(c?.payload?.feeApproximateUsdValue ?? 0);
+          if (!isNaN(usd)) totalFeeUsd += usd;
+        }
+      }
+
+      // Estimate source chain gas cost (chain-aware)
+      const gasUnits = getGasUnits("debridge", params.fromChainId);
+      const gasEstimate = await estimateGasCostUsd(params.fromChainId, gasUnits);
+      const gasCostUsd = gasEstimate?.costUsd ?? null;
+
+      // deBridge DLN is intent-based: the recommended amount is what the solver commits to deliver.
+      // Use recommendedAmount if available (guaranteed), otherwise apply 0.5% slippage to estimated.
+      const recommendedRaw = data.estimation.dstChainTokenOut?.recommendedAmount;
+      let minOutputRaw: string;
+      if (recommendedRaw) {
+        minOutputRaw = recommendedRaw;
+      } else {
+        // Apply 0.5% slippage tolerance
+        try {
+          const outputBig = BigInt(dstAmount);
+          minOutputRaw = (outputBig * 995n / 1000n).toString();
+        } catch {
+          minOutputRaw = dstAmount;
+        }
+      }
 
       return {
+        backendName: "debridge",
         provider: "deBridge (direct)",
         outputAmount: formatTokenAmount(dstAmount, dstDecimals),
         outputAmountRaw: dstAmount,
-        estimatedFeeUsd: totalFeeUsd,
-        feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: totalFeeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd },
+        minOutputAmount: formatTokenAmount(minOutputRaw, dstDecimals),
+        minOutputAmountRaw: minOutputRaw,
+        outputDecimals: dstDecimals,
+        estimatedGasCostUsd: gasCostUsd,
+        usingFallbackPrices: gasEstimate?.usingFallbackPrices,
+        estimatedFeeUsd: gasCostUsd !== null ? totalFeeUsd + gasCostUsd : null,
+        feeBreakdown: {
+          gasCostUsd,
+          protocolFeeUsd: totalFeeUsd,
+          integratorFeeUsd: 0,
+          integratorFeePercent: null,
+          totalFeeUsd: gasCostUsd !== null ? totalFeeUsd + gasCostUsd : null,
+        },
         estimatedTimeSeconds: data.estimation.estimatedFulfillmentDelay ?? 30,
         route: `${srcTokenSymbol} → deBridge DLN → ${dstTokenSymbol}`,
         quoteData: {
@@ -97,7 +144,10 @@ export class DeBridgeBackend implements BridgeBackend {
             toAddress: params.toAddress || params.fromAddress,
           },
         },
-        expiresAt: Date.now() + 60_000,
+        // deBridge DLN quotes: use estimation expiry if available, else conservative 30s
+        expiresAt: data.estimation?.expiration
+          ? new Date(data.estimation.expiration).getTime()
+          : Date.now() + 30_000,
       };
     } catch (err) {
       console.error("[debridge] quote error:", (err as Error).message);
@@ -110,26 +160,51 @@ export class DeBridgeBackend implements BridgeBackend {
     const p = qd.params;
 
     // Use create-tx endpoint to get the actual transaction
+    // Apply backend-specific chain ID mapping (same as getQuote)
+    const srcChainId = getBackendChainId("debridge", p.srcChainId);
+    const dstChainId = getBackendChainId("debridge", p.dstChainId);
+
     const url = new URL(`${BASE_URL}/dln/order/create-tx`);
-    url.searchParams.set("srcChainId", String(p.srcChainId));
+    url.searchParams.set("srcChainId", String(srcChainId));
     url.searchParams.set("srcChainTokenIn", p.srcChainTokenIn);
     url.searchParams.set("srcChainTokenInAmount", p.srcChainTokenInAmount);
-    url.searchParams.set("dstChainId", String(p.dstChainId));
+    url.searchParams.set("dstChainId", String(dstChainId));
     url.searchParams.set("dstChainTokenOut", p.dstChainTokenOut);
     url.searchParams.set("dstChainTokenOutAmount", "auto");
     url.searchParams.set("srcChainOrderAuthorityAddress", p.fromAddress);
     url.searchParams.set("dstChainTokenOutRecipient", p.toAddress);
+    // senderAddress is REQUIRED for the API to return tx.to/tx.data/tx.value
+    url.searchParams.set("senderAddress", p.fromAddress);
+    url.searchParams.set("srcChainRefundAddress", p.fromAddress);
+    url.searchParams.set("dstChainOrderAuthorityAddress", p.toAddress);
     url.searchParams.set("prependOperatingExpenses", "true");
     if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
       url.searchParams.set("affiliateFeePercent", this.affiliateFeePercent);
       url.searchParams.set("affiliateFeeRecipient", this.affiliateFeeRecipient);
     }
 
-    const data = await fetchJson(url.toString());
+    let data: any;
+    try {
+      data = await fetchJson(url.toString());
+    } catch (err) {
+      if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
+        console.warn("[debridge] create-tx failed with affiliate fee, retrying without:", (err as Error).message);
+        url.searchParams.delete("affiliateFeePercent");
+        url.searchParams.delete("affiliateFeeRecipient");
+        data = await fetchJson(url.toString());
+      } else {
+        throw err;
+      }
+    }
 
-    if (!data.tx) throw new Error("No transaction in deBridge create-tx response");
+    if (!data.tx || !data.tx.to || !data.tx.data) {
+      throw new Error(
+        "Invalid or missing transaction data in deBridge create-tx response. " +
+        "Ensure senderAddress is provided."
+      );
+    }
 
-    const orderId = data.orderId ?? `debridge:${Date.now()}`;
+    const orderId = data.orderId ?? `${Date.now()}`;
 
     const result: TransactionRequest = {
       to: data.tx.to,
@@ -141,10 +216,16 @@ export class DeBridgeBackend implements BridgeBackend {
     };
 
     // Check if ERC20 approval is needed (non-native token)
-    if (data.tx.allowanceTarget && p.srcChainTokenIn !== "0x0000000000000000000000000000000000000000") {
+    // deBridge API doesn't return allowanceTarget — use tx.to (the DlnSource contract)
+    // as the spender for the ERC20 approval.
+    // When prependOperatingExpenses=true, the contract pulls MORE than the user's input amount
+    // (input + operating expenses). Use the actual amount from estimation if available.
+    const approvalSpender = data.tx.allowanceTarget ?? data.tx.to;
+    if (approvalSpender && p.srcChainTokenIn !== "0x0000000000000000000000000000000000000000") {
+      const actualInputAmount = data.estimation?.srcChainTokenIn?.amount ?? p.srcChainTokenInAmount;
       result.approvalTx = {
         to: p.srcChainTokenIn,
-        data: buildApproveData(data.tx.allowanceTarget, p.srcChainTokenInAmount),
+        data: buildApproveData(approvalSpender, actualInputAmount),
         value: "0x0",
         chainId: p.srcChainId,
       };

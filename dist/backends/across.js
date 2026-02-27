@@ -1,5 +1,23 @@
+import { Interface } from "ethers";
 import { formatTokenAmount } from "../utils/tokens.js";
 import { getAllChains } from "../utils/chains.js";
+import { buildApproveData, isNativeToken } from "../utils/evm.js";
+import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { lookupByAddress } from "../utils/token-registry.js";
+/** WETH addresses by chain — Across requires WETH address for native ETH bridging */
+const WETH_BY_CHAIN = {
+    1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // Ethereum
+    10: "0x4200000000000000000000000000000000000006", // Optimism
+    56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", // BSC (WBNB)
+    137: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // Polygon (WMATIC)
+    8453: "0x4200000000000000000000000000000000000006", // Base
+    42161: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", // Arbitrum
+    43114: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7", // Avalanche (WAVAX)
+};
+/** Across V3 SpokePool depositV3 ABI fragment */
+const SPOKE_POOL_ABI = new Interface([
+    "function depositV3(address depositor, address recipient, address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 destinationChainId, address exclusiveRelayer, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes message)",
+]);
 const BASE_URL = "https://app.across.to/api";
 const TIMEOUT_MS = 15_000;
 async function fetchJson(url, init) {
@@ -17,12 +35,11 @@ async function fetchJson(url, init) {
         clearTimeout(timer);
     }
 }
-function buildApproveData(spender, amount) {
-    const spenderPadded = spender.toLowerCase().replace("0x", "").padStart(64, "0");
-    const amountHex = BigInt(amount).toString(16).padStart(64, "0");
-    return `0x095ea7b3${spenderPadded}${amountHex}`;
-}
-// Across SpokePool addresses per chain
+// buildApproveData imported from ../utils/evm.js
+// Across V3 SpokePool addresses per chain (NEW-LOW-002)
+// These addresses are from Across Protocol V3 deployment.
+// Verified: 2025-02-25. If Across upgrades to V4 or redeploys contracts,
+// these addresses MUST be updated. Check: https://docs.across.to/reference/contract-addresses
 const SPOKE_POOLS = {
     1: "0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5",
     10: "0x6f26Bf09B1C792e3228e5467807a900A503c0281",
@@ -43,14 +60,27 @@ export class AcrossBackend {
         try {
             // Across only supports same-token bridging (e.g. USDC→USDC across chains).
             // Skip cross-token swaps — those should go through aggregators like LI.FI.
+            // NOTE: We compare by symbol, not address, because the same token (e.g. USDC)
+            // has different contract addresses on different chains.
             if (params.fromTokenAddress.toLowerCase() !== params.toTokenAddress.toLowerCase()) {
-                return null;
+                const fromToken = lookupByAddress(params.fromTokenAddress, params.fromChainId);
+                const toToken = lookupByAddress(params.toTokenAddress, params.toChainId);
+                // If both are known tokens with the same symbol, Across can bridge them.
+                // If either is unknown or symbols differ, skip — let aggregators handle it.
+                if (!fromToken || !toToken || fromToken.symbol !== toToken.symbol) {
+                    return null;
+                }
             }
             // Across uses suggested-fees to get the fee structure for a route
             const url = new URL(`${BASE_URL}/suggested-fees`);
             url.searchParams.set("originChainId", String(params.fromChainId));
             url.searchParams.set("destinationChainId", String(params.toChainId));
-            url.searchParams.set("token", params.fromTokenAddress);
+            // Across needs WETH address for native tokens
+            const isNative = isNativeToken(params.fromTokenAddress);
+            const acrossToken = isNative
+                ? (WETH_BY_CHAIN[params.fromChainId] ?? params.fromTokenAddress)
+                : params.fromTokenAddress;
+            url.searchParams.set("token", acrossToken);
             url.searchParams.set("amount", params.amountRaw);
             if (this.referrer) {
                 url.searchParams.set("referrer", this.referrer);
@@ -64,15 +94,39 @@ export class AcrossBackend {
             if (outputBig <= 0n)
                 return null;
             const outputRaw = outputBig.toString();
-            const decimals = params.fromTokenDecimals ?? 18;
-            const feeUsd = Number(data.totalRelayFee.total ?? "0") / Math.pow(10, decimals);
+            // Use token decimals from the API response if available, fall back to params or registry
+            const decimals = data.inputToken?.decimals ?? params.fromTokenDecimals ?? 6;
+            // Across doesn't provide USD fee estimates — we get fee in token units.
+            // Convert to human-readable token amount. For stablecoins this ≈ USD,
+            // for other tokens it's an approximation (would need price oracle for true USD).
+            const feeTokenAmount = Number(formatTokenAmount(totalFeeBig.toString(), decimals));
+            // Use token amount as fee estimate — close enough for stablecoins,
+            // and we label it clearly in the fee breakdown.
+            const feeUsd = feeTokenAmount;
             const estimatedFillTime = data.estimatedFillTimeSec ?? 120;
+            // Estimate source chain gas cost (chain-aware)
+            const gasUnits = getGasUnits("across", params.fromChainId);
+            const gasEstimate = await estimateGasCostUsd(params.fromChainId, gasUnits);
+            const gasCostUsd = gasEstimate?.costUsd ?? null;
             return {
+                backendName: "across",
                 provider: "Across (direct)",
                 outputAmount: formatTokenAmount(outputRaw, decimals),
                 outputAmountRaw: outputRaw,
-                estimatedFeeUsd: feeUsd,
-                feeBreakdown: { gasCostUsd: 0, protocolFeeUsd: feeUsd, integratorFeeUsd: 0, integratorFeePercent: null, totalFeeUsd: feeUsd },
+                // Across is intent-based with deterministic pricing — min = estimated
+                minOutputAmount: formatTokenAmount(outputRaw, decimals),
+                minOutputAmountRaw: outputRaw,
+                outputDecimals: decimals,
+                estimatedGasCostUsd: gasCostUsd,
+                usingFallbackPrices: gasEstimate?.usingFallbackPrices,
+                estimatedFeeUsd: gasCostUsd !== null ? Math.round((feeUsd + gasCostUsd) * 100) / 100 : null,
+                feeBreakdown: {
+                    gasCostUsd,
+                    protocolFeeUsd: Math.round(feeUsd * 100) / 100,
+                    integratorFeeUsd: 0,
+                    integratorFeePercent: null,
+                    totalFeeUsd: gasCostUsd !== null ? Math.round((feeUsd + gasCostUsd) * 100) / 100 : null,
+                },
                 estimatedTimeSeconds: estimatedFillTime,
                 route: `Across Protocol (fast bridge)`,
                 quoteData: {
@@ -92,6 +146,11 @@ export class AcrossBackend {
                     exclusiveRelayer: data.exclusiveRelayer ?? "0x0000000000000000000000000000000000000000",
                     exclusivityDeadline: data.exclusivityDeadline ?? 0,
                 },
+                // Across quotes are based on a specific timestamp. The fee structure
+                // is valid for a limited window. Use the shorter of: the API-provided
+                // exclusivityDeadline or a conservative 60s default.
+                // exclusivityDeadline from the API is a small relative offset (e.g. 5 seconds),
+                // NOT an epoch timestamp. Use a conservative 60s TTL for quote validity.
                 expiresAt: Date.now() + 60_000,
             };
         }
@@ -107,30 +166,22 @@ export class AcrossBackend {
         if (!spokePool) {
             throw new Error(`Across: no SpokePool address for chain ${p.fromChainId}`);
         }
-        // Build depositV3 calldata for Across SpokePool
-        // depositV3(address depositor, address recipient, address inputToken, address outputToken,
-        //           uint256 inputAmount, uint256 outputAmount, uint256 destinationChainId,
-        //           address exclusiveRelayer, uint32 quoteTimestamp, uint32 fillDeadline,
-        //           uint32 exclusivityDeadline, bytes message)
-        const selector = "0xe7a050aa"; // depositV3 selector
-        const depositor = p.fromAddress.toLowerCase().replace("0x", "").padStart(64, "0");
-        const recipient = (p.toAddress || p.fromAddress).toLowerCase().replace("0x", "").padStart(64, "0");
-        const inputToken = p.fromTokenAddress.toLowerCase().replace("0x", "").padStart(64, "0");
-        const outputToken = p.toTokenAddress.toLowerCase().replace("0x", "").padStart(64, "0");
-        const inputAmount = BigInt(p.amountRaw).toString(16).padStart(64, "0");
-        const outputAmount = BigInt(p.outputRaw).toString(16).padStart(64, "0");
-        const destChainId = BigInt(p.toChainId).toString(16).padStart(64, "0");
-        const exclusiveRelayer = (qd.exclusiveRelayer ?? "0x0000000000000000000000000000000000000000")
-            .toLowerCase().replace("0x", "").padStart(64, "0");
-        const quoteTimestamp = (qd.timestamp ?? Math.floor(Date.now() / 1000)).toString(16).padStart(64, "0");
-        // Fill deadline: 1 hour from now
-        const fillDeadline = (Math.floor(Date.now() / 1000) + 3600).toString(16).padStart(64, "0");
-        const exclusivityDeadline = (qd.exclusivityDeadline ?? 0).toString(16).padStart(64, "0");
-        // Message offset and empty message
-        const messageOffset = (12 * 32).toString(16).padStart(64, "0"); // offset to message bytes
-        const messageLength = "0".padStart(64, "0"); // empty message
-        const calldata = `${selector}${depositor}${recipient}${inputToken}${outputToken}${inputAmount}${outputAmount}${destChainId}${exclusiveRelayer}${quoteTimestamp}${fillDeadline}${exclusivityDeadline}${messageOffset}${messageLength}`;
-        const isNative = p.fromTokenAddress === "0x0000000000000000000000000000000000000000";
+        const isNative = isNativeToken(p.fromTokenAddress);
+        // Build depositV3 calldata using ethers Interface (V3-LOW-002)
+        const calldata = SPOKE_POOL_ABI.encodeFunctionData("depositV3", [
+            p.fromAddress, // depositor
+            p.toAddress || p.fromAddress, // recipient
+            isNative ? (WETH_BY_CHAIN[p.fromChainId] ?? p.fromTokenAddress) : p.fromTokenAddress, // inputToken (WETH for native)
+            isNativeToken(p.toTokenAddress) ? (WETH_BY_CHAIN[p.toChainId] ?? p.toTokenAddress) : p.toTokenAddress, // outputToken (WETH for native)
+            BigInt(p.amountRaw), // inputAmount
+            BigInt(p.outputRaw), // outputAmount
+            BigInt(p.toChainId), // destinationChainId
+            qd.exclusiveRelayer ?? "0x0000000000000000000000000000000000000000", // exclusiveRelayer
+            qd.timestamp ?? Math.floor(Date.now() / 1000), // quoteTimestamp
+            Math.floor(Date.now() / 1000) + 3600, // fillDeadline (1 hour)
+            qd.exclusivityDeadline ?? 0, // exclusivityDeadline
+            "0x", // message (empty)
+        ]);
         const result = {
             to: spokePool,
             data: calldata,

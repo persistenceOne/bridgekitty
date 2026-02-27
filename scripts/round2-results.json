@@ -1,0 +1,54 @@
+{
+  "startBalances": {
+    "Optimism": {
+      "eth": "0.00013521719199104",
+      "usdc": "1.406851"
+    },
+    "Base": {
+      "eth": "0.000019690147653733",
+      "usdc": "0.611003"
+    },
+    "Arbitrum": {
+      "eth": "0.000478100579898",
+      "usdc": "0.812034"
+    }
+  },
+  "endBalances": {
+    "Optimism": {
+      "eth": "0.00013521719199104",
+      "usdc": "1.956578"
+    },
+    "Base": {
+      "eth": "0.000019690147653733",
+      "usdc": "0.611003"
+    },
+    "Arbitrum": {
+      "eth": "0.000475479385282",
+      "usdc": "0.262034"
+    }
+  },
+  "results": [
+    {
+      "label": "Across (fixed)",
+      "backend": "across",
+      "route": "Arbitrum → Optimism",
+      "amount": "0.55",
+      "txHash": "0x51bb715ffac9331bde110531e9d9e125265d266ff34f3fcf5c0579c766825052",
+      "status": "completed",
+      "timeSeconds": 26,
+      "outputExpected": "0.549727"
+    },
+    {
+      "label": "deBridge",
+      "backend": "debridge",
+      "route": "Arbitrum → Base",
+      "amount": "0.25",
+      "txHash": "",
+      "status": "error",
+      "timeSeconds": 3,
+      "outputExpected": "0.2498",
+      "error": "Insufficient ETH: need ~0.0012 ETH (value: 0.001, gas: ~0.0002), have 0.000475479385282"
+    }
+  ],
+  "timestamp": "2026-02-25T10:00:32.629Z"
+}
