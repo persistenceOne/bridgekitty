@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { sanitizeError } from "../utils/sanitize-error.js";
+import { getChainRpcUrl } from "../utils/gas-estimator.js";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const TIMEOUT_MS = 15_000;
@@ -41,10 +42,19 @@ export function getConfigDir(): string {
   return dir;
 }
 
-const EVM_RPC_URLS: Record<string, { chainId: number; rpc: string; symbol: string }> = {
-  ethereum: { chainId: 1, rpc: "https://eth.llamarpc.com", symbol: "ETH" },
-  base: { chainId: 8453, rpc: "https://mainnet.base.org", symbol: "ETH" },
-  bsc: { chainId: 56, rpc: "https://bsc-dataseed1.binance.org", symbol: "BNB" },
+const EVM_CHAINS: Record<string, { chainId: number; symbol: string }> = {
+  ethereum:  { chainId: 1,      symbol: "ETH" },
+  optimism:  { chainId: 10,     symbol: "ETH" },
+  bsc:       { chainId: 56,     symbol: "BNB" },
+  polygon:   { chainId: 137,    symbol: "POL" },
+  arbitrum:  { chainId: 42161,  symbol: "ETH" },
+  avalanche: { chainId: 43114,  symbol: "AVAX" },
+  base:      { chainId: 8453,   symbol: "ETH" },
+  linea:     { chainId: 59144,  symbol: "ETH" },
+  scroll:    { chainId: 534352, symbol: "ETH" },
+  zksync:    { chainId: 324,    symbol: "ETH" },
+  mantle:    { chainId: 5000,   symbol: "MNT" },
+  blast:     { chainId: 81457,  symbol: "ETH" },
 };
 
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
@@ -146,7 +156,10 @@ export function registerWalletTools(server: McpServer) {
             text: JSON.stringify({
               status: "success",
               wallets: {
-                evm: evmAddress,
+                evm: {
+                  address: evmAddress,
+                  chains: Object.keys(EVM_CHAINS),
+                },
                 persistence: persistenceAddress,
                 solana: solanaAddress,
               },
@@ -170,7 +183,7 @@ export function registerWalletTools(server: McpServer) {
     "wallet_balance",
     "Check wallet balances across all chains (EVM, Cosmos, Solana).",
     {
-      chains: z.array(z.string()).optional().describe("Chains to check (default: all). Options: ethereum, base, bsc, persistence, solana"),
+      chains: z.array(z.string()).optional().describe("Chains to check (default: all). Options: ethereum, optimism, bsc, polygon, arbitrum, avalanche, base, linea, scroll, zksync, mantle, blast, persistence, solana"),
     },
     async (params) => {
       const privateKey = getKey("privateKey");
@@ -185,19 +198,33 @@ export function registerWalletTools(server: McpServer) {
       }
 
       const evmAddress = new ethers.Wallet(privateKey).address;
-      const chainsToCheck = params.chains ?? ["ethereum", "base", "bsc", "persistence", "solana"];
+      const chainsToCheck = params.chains ?? [...Object.keys(EVM_CHAINS), "persistence", "solana"];
       const balances: Record<string, string> = {};
 
-      // EVM chains
-      for (const chain of chainsToCheck) {
-        const evmChain = EVM_RPC_URLS[chain];
-        if (!evmChain) continue;
-        try {
-          const provider = new ethers.JsonRpcProvider(evmChain.rpc);
+      // EVM chains — same address on all chains, fetch balances in parallel
+      const evmChains = chainsToCheck
+        .filter((c) => EVM_CHAINS[c])
+        .map((c) => ({ name: c, ...EVM_CHAINS[c] }));
+
+      const evmResults = await Promise.allSettled(
+        evmChains.map(async (chain) => {
+          const rpc = getChainRpcUrl(chain.chainId);
+          if (!rpc) throw new Error("no RPC configured");
+          const provider = new ethers.JsonRpcProvider(rpc);
           const bal = await provider.getBalance(evmAddress);
-          balances[`${chain} (${evmChain.symbol})`] = ethers.formatEther(bal);
-        } catch (err) {
-          balances[`${chain} (${evmChain.symbol})`] = `error: ${sanitizeError(err as Error)}`;
+          return { name: chain.name, symbol: chain.symbol, balance: ethers.formatEther(bal) };
+        })
+      );
+
+      for (const result of evmResults) {
+        if (result.status === "fulfilled") {
+          const { name, symbol, balance } = result.value;
+          balances[`${name} (${symbol})`] = balance;
+        } else {
+          // Find which chain failed by index
+          const idx = evmResults.indexOf(result);
+          const chain = evmChains[idx];
+          balances[`${chain.name} (${chain.symbol})`] = `error: ${sanitizeError(result.reason as Error)}`;
         }
       }
 
