@@ -3,6 +3,7 @@ import { ethers } from "ethers";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import { sanitizeError } from "../utils/sanitize-error.js";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
@@ -23,6 +24,21 @@ export function getKey(name: "privateKey" | "mnemonic" | "solanaKey"): string | 
     return val;
   }
   return undefined;
+}
+
+/**
+ * Returns the BridgeKitty config directory. Resolution order:
+ * 1. BRIDGEKITTY_HOME env var (if set)
+ * 2. ~/.bridgekitty/
+ *
+ * Creates the directory if it doesn't exist (mode 0o700).
+ */
+export function getConfigDir(): string {
+  const dir = process.env.BRIDGEKITTY_HOME || path.join(os.homedir(), ".bridgekitty");
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  return dir;
 }
 
 const EVM_RPC_URLS: Record<string, { chainId: number; rpc: string; symbol: string }> = {
@@ -53,19 +69,19 @@ export function registerWalletTools(server: McpServer) {
   // ─── wallet_setup ─────────────────────────────────────────────────────────
   server.tool(
     "wallet_setup",
-    "Create wallets for all supported chains (EVM, Cosmos, Solana) from a single mnemonic. Run this once — keys are saved to .env.",
+    "Create wallets for all supported chains (EVM, Cosmos, Solana) from a single mnemonic. Run this once — keys are saved to ~/.bridgekitty/.env.",
     {},
     async () => {
       try {
         // C-1: Check if .env already exists with keys — refuse to overwrite
-        const envPath = path.resolve(process.cwd(), ".env");
+        const envPath = path.resolve(getConfigDir(), ".env");
         if (fs.existsSync(envPath)) {
           const existing = fs.readFileSync(envPath, "utf-8");
           if (existing.includes("PRIVATE_KEY")) {
             return {
               content: [{
                 type: "text" as const,
-                text: "ERROR: .env file already contains PRIVATE_KEY. To regenerate wallets, delete the existing .env file first (back it up!) or use a different directory. This safeguard prevents accidental key loss.",
+                text: `ERROR: ${envPath} already contains PRIVATE_KEY. To regenerate wallets, delete the existing file first (back it up!). This safeguard prevents accidental key loss.`,
               }],
               isError: true,
             };

@@ -16,13 +16,13 @@ import { registerCheckStatus } from "./tools/check-status.js";
 import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
 import { registerXprtFarmTools } from "./tools/xprt-farm.js";
-import { registerWalletTools, getKey } from "./tools/wallet.js";
+import { registerWalletTools, getKey, getConfigDir } from "./tools/wallet.js";
 import * as fs from "fs";
 import * as path from "path";
 
-// Auto-load .env from CWD
+// Auto-load .env from stable config directory (~/.bridgekitty/ or BRIDGEKITTY_HOME)
 function loadDotEnv(): void {
-  const envPath = path.resolve(process.cwd(), ".env");
+  const envPath = path.resolve(getConfigDir(), ".env");
   if (!fs.existsSync(envPath)) return;
 
   // L-1: Warn if .env permissions are too permissive
@@ -52,6 +52,22 @@ function loadDotEnv(): void {
 }
 
 loadDotEnv();
+
+// Migration hint: if old CWD-based .env exists but config dir one doesn't, warn user
+try {
+  const oldEnvPath = path.resolve(process.cwd(), ".env");
+  const newEnvPath = path.resolve(getConfigDir(), ".env");
+  if (oldEnvPath !== newEnvPath && fs.existsSync(oldEnvPath) && !fs.existsSync(newEnvPath)) {
+    const oldContent = fs.readFileSync(oldEnvPath, "utf-8");
+    if (oldContent.includes("PRIVATE_KEY")) {
+      console.error(
+        `⚠️  Found .env with PRIVATE_KEY at ${oldEnvPath} (old CWD-based location). ` +
+        `BridgeKitty now uses ${path.resolve(getConfigDir(), ".env")}. ` +
+        `Move your .env: mv "${oldEnvPath}" "${newEnvPath}"`
+      );
+    }
+  }
+} catch { /* non-fatal */ }
 
 // MEDIUM-002: Immediately move sensitive keys from process.env to in-memory store.
 // loadDotEnv puts everything into process.env; calling getKey() moves them to the
@@ -118,7 +134,8 @@ async function main() {
     console.log("    Add to .cursor/mcp.json with the same format.\n");
     console.log("  Direct (stdio):");
     console.log("    npx bridgekitty --stdio\n");
-    console.log("Docs: https://github.com/persistenceOne/bridgekitty");
+    console.log("Config: ~/.bridgekitty/.env (override with BRIDGEKITTY_HOME env var)");
+    console.log("Docs:   https://github.com/persistenceOne/bridgekitty");
     process.exit(0);
   }
 
