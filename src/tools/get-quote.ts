@@ -112,7 +112,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         };
 
       // Rate limit check per route
-      const routeKey = `${fromChainId}:${toChainId}:${params.fromToken.toLowerCase()}:${params.toToken.toLowerCase()}`;
+      const routeKey = `${fromChainId}:${toChainId}:${params.fromToken.toLowerCase()}:${params.toToken.toLowerCase()}:${params.fromAddress.toLowerCase()}`;
       if (!checkRateLimit(routeKey)) {
         return {
           content: [{

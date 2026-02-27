@@ -178,8 +178,8 @@ export class RoutingEngine {
             ? b.getQuotes(params)
             : b.getQuote(params).then((q) => (q ? [q] : []))
           ).then((quotes) => ({ backendName: b.name, quotes })),
-          new Promise<{ backendName: string; quotes: BridgeQuote[] }>((resolve) =>
-            setTimeout(() => resolve({ backendName: b.name, quotes: [] }), BACKEND_TIMEOUT_MS)
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Backend ${b.name} timed out after ${BACKEND_TIMEOUT_MS}ms`)), BACKEND_TIMEOUT_MS)
           ),
         ])
       )

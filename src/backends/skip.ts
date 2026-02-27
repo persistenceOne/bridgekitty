@@ -11,6 +11,7 @@ import type {
 import { formatTokenAmount } from "../utils/tokens.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { lookupByAddress } from "../utils/token-registry.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 
 const BASE_URL = "https://api.skip.build";
 const TIMEOUT_MS = 15_000;
@@ -64,6 +65,16 @@ export class SkipBackend implements BridgeBackend {
       });
 
       if (!data.amount_out) return null;
+
+      // Filter out Cosmos-only routes that can't produce EVM transactions.
+      // Skip supports IBC/Cosmos chains with string chain IDs (e.g. "cosmoshub-4").
+      // Our buildTransaction() only handles EVM tx, so reject routes where
+      // all chain_ids are non-numeric (Cosmos) strings.
+      const chainIds: string[] = data.chain_ids ?? [];
+      if (chainIds.length > 0) {
+        const hasEvmChain = chainIds.some((id: string) => /^\d+$/.test(id));
+        if (!hasEvmChain) return null; // Pure Cosmos route — can't build EVM tx
+      }
 
       const outputRaw = data.amount_out;
       // Skip API doesn't return token decimals — resolve from registry or params
@@ -278,7 +289,7 @@ export class SkipBackend implements BridgeBackend {
     } catch (err) {
       return {
         state: "unknown",
-        humanReadable: `Status check failed: ${(err as Error).message}`,
+        humanReadable: `Status check failed: ${sanitizeError(err as Error)}`,
         provider: "skip",
         elapsed: 0,
       };

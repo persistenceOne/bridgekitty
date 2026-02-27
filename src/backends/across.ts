@@ -13,6 +13,7 @@ import { getAllChains } from "../utils/chains.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 import { lookupByAddress } from "../utils/token-registry.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 
 /** WETH addresses by chain — Across requires WETH address for native ETH bridging */
 const WETH_BY_CHAIN: Record<number, string> = {
@@ -277,7 +278,7 @@ export class AcrossBackend implements BridgeBackend {
     } catch (err) {
       return {
         state: "unknown",
-        humanReadable: `Status check failed: ${(err as Error).message}`,
+        humanReadable: `Status check failed: ${sanitizeError(err as Error)}`,
         provider: "across",
         elapsed: 0,
       };

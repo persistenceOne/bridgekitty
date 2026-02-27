@@ -106,6 +106,22 @@ const PKG_VERSION = (() => {
 })();
 
 async function main() {
+  // TTY detection: if run directly in a terminal (not piped), show help and exit.
+  // MCP servers communicate over stdio JSON-RPC — running in a TTY means the user
+  // probably ran `npx bridgekitty` directly instead of configuring it as an MCP server.
+  if (process.stdin.isTTY && !process.argv.includes("--stdio")) {
+    console.log(`BridgeKitty 🐱 v${PKG_VERSION} — Cross-chain bridge aggregator MCP server\n`);
+    console.log("This is an MCP (Model Context Protocol) server. Add it to your AI tool's config:\n");
+    console.log("  Claude Desktop / Claude Code:");
+    console.log('    { "mcpServers": { "bridgekitty": { "command": "npx", "args": ["bridgekitty"] } } }\n');
+    console.log("  Cursor:");
+    console.log("    Add to .cursor/mcp.json with the same format.\n");
+    console.log("  Direct (stdio):");
+    console.log("    npx bridgekitty --stdio\n");
+    console.log("Docs: https://github.com/persistenceOne/bridgekitty");
+    process.exit(0);
+  }
+
   const engine = createEngine();
 
   const server = new McpServer({

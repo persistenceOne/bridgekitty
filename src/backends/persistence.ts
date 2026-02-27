@@ -10,6 +10,7 @@ import type {
 import { BackendValidationError } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 
 /**
  * @deprecated Use BackendValidationError from types.ts instead.
@@ -653,7 +654,7 @@ export class PersistenceBackend implements BridgeBackend {
     } catch (err) {
       return {
         state: "unknown",
-        humanReadable: `Status check failed: ${(err as Error).message}`,
+        humanReadable: `Status check failed: ${sanitizeError(err as Error)}`,
         provider: "persistence",
         elapsed: 0,
       };

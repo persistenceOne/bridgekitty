@@ -11,6 +11,7 @@ import { formatTokenAmount } from "../utils/tokens.js";
 import { getBackendChainId, getAllChains } from "../utils/chains.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 
 const BASE_URL = "https://api.dln.trade/v1.0";
 const TIMEOUT_MS = 15_000;
@@ -271,7 +272,7 @@ export class DeBridgeBackend implements BridgeBackend {
     } catch (err) {
       return {
         state: "unknown",
-        humanReadable: `Status check failed: ${(err as Error).message}`,
+        humanReadable: `Status check failed: ${sanitizeError(err as Error)}`,
         provider: "debridge",
         elapsed: 0,
       };
