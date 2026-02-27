@@ -31,20 +31,21 @@ const CHAIN_RPC_ENV_KEYS: Record<number, string> = {
   81457: "RPC_BLAST",
 };
 
-// Default public RPCs per chain (used when env var not set)
-const DEFAULT_CHAIN_RPCS: Record<number, string> = {
-  1: "https://rpc.ankr.com/eth",
-  10: "https://rpc.ankr.com/optimism",
-  56: "https://rpc.ankr.com/bsc",
-  137: "https://rpc.ankr.com/polygon",
-  42161: "https://rpc.ankr.com/arbitrum",
-  43114: "https://rpc.ankr.com/avalanche",
-  8453: "https://rpc.ankr.com/base",
-  59144: "https://rpc.ankr.com/linea",
-  534352: "https://rpc.ankr.com/scroll",
-  324: "https://rpc.ankr.com/zksync_era",
-  5000: "https://rpc.ankr.com/mantle",
-  81457: "https://rpc.ankr.com/blast",
+// Default public RPCs per chain with failover (used when env var not set)
+// Multiple endpoints per chain for reliability — tried in order on failure.
+const DEFAULT_CHAIN_RPCS: Record<number, string[]> = {
+  1: ["https://rpc.ankr.com/eth", "https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+  10: ["https://rpc.ankr.com/optimism", "https://optimism-rpc.publicnode.com", "https://optimism.drpc.org"],
+  56: ["https://rpc.ankr.com/bsc", "https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"],
+  137: ["https://rpc.ankr.com/polygon", "https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
+  42161: ["https://rpc.ankr.com/arbitrum", "https://arbitrum-one-rpc.publicnode.com", "https://arbitrum.drpc.org"],
+  43114: ["https://rpc.ankr.com/avalanche", "https://avalanche-c-chain-rpc.publicnode.com"],
+  8453: ["https://rpc.ankr.com/base", "https://base-rpc.publicnode.com", "https://base.drpc.org"],
+  59144: ["https://rpc.ankr.com/linea", "https://linea-rpc.publicnode.com"],
+  534352: ["https://rpc.ankr.com/scroll", "https://scroll-rpc.publicnode.com"],
+  324: ["https://rpc.ankr.com/zksync_era", "https://zksync-era-rpc.publicnode.com"],
+  5000: ["https://rpc.ankr.com/mantle", "https://mantle-rpc.publicnode.com"],
+  81457: ["https://rpc.ankr.com/blast", "https://blast-rpc.publicnode.com"],
 };
 
 /** M-3: Validate that an RPC URL uses HTTPS (except localhost) */
@@ -54,14 +55,20 @@ function validateRpcUrl(url: string): string {
   throw new Error(`Insecure RPC URL rejected: only HTTPS URLs are allowed (got ${url.split("/").slice(0, 3).join("/")})`);
 }
 
-/** Resolve RPC URL for a chain: env var override → default Ankr URL */
-export function getChainRpcUrl(chainId: number): string | undefined {
+/** Resolve RPC URLs for a chain: env var override → default RPCs with failover */
+export function getChainRpcUrls(chainId: number): string[] {
   const envKey = CHAIN_RPC_ENV_KEYS[chainId];
   if (envKey && process.env[envKey]) {
-    return validateRpcUrl(process.env[envKey]!);
+    return [validateRpcUrl(process.env[envKey]!)];
   }
-  const defaultUrl = DEFAULT_CHAIN_RPCS[chainId];
-  return defaultUrl ? validateRpcUrl(defaultUrl) : undefined;
+  const defaults = DEFAULT_CHAIN_RPCS[chainId];
+  return defaults ? defaults.map(validateRpcUrl) : [];
+}
+
+/** Resolve primary RPC URL for a chain (backward compat) */
+export function getChainRpcUrl(chainId: number): string | undefined {
+  const urls = getChainRpcUrls(chainId);
+  return urls.length > 0 ? urls[0] : undefined;
 }
 
 // Native token address (used by LI.FI) — zero address for EVM chains
@@ -122,6 +129,10 @@ export function getGasUnits(backend: string, chainId: number): number | null {
       return chainId === ETH_MAINNET ? 150_000 : 65_000;
     case "across":
       return chainId === ETH_MAINNET ? 120_000 : 65_000;
+    case "relay":
+      return chainId === ETH_MAINNET ? 130_000 : 65_000;
+    case "skip":
+      return chainId === ETH_MAINNET ? 150_000 : 80_000;
     case "persistence":
       // Only supports Base (8453) and BSC (56)
       if (chainId === 8453 || chainId === 56) return 80_000;
@@ -145,51 +156,58 @@ async function getGasPriceWei(chainId: number): Promise<{ priceWei: bigint; isFa
     return { priceWei: cached.priceWei, isFallback: false };
   }
 
-  const rpcUrl = getChainRpcUrl(chainId);
-  if (!rpcUrl) {
+  const rpcUrls = getChainRpcUrls(chainId);
+  if (rpcUrls.length === 0) {
     // No RPC configured — use fallback if available
     const fallbackGwei = FALLBACK_GAS_PRICE_GWEI[chainId];
     if (fallbackGwei === undefined) return null; // Truly unknown chain
     return { priceWei: BigInt(Math.round(fallbackGwei * 1e9)), isFallback: true };
   }
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+  // Try each RPC in order until one succeeds
+  let lastError: Error | null = null;
+  for (const rpcUrl of rpcUrls) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
 
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "eth_gasPrice",
-        params: [],
-        id: 1,
-      }),
-      signal: controller.signal,
-    });
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_gasPrice",
+          params: [],
+          id: 1,
+        }),
+        signal: controller.signal,
+      });
 
-    clearTimeout(timer);
+      clearTimeout(timer);
 
-    if (!res.ok) throw new Error(`RPC ${res.status}`);
+      if (!res.ok) throw new Error(`RPC ${res.status}`);
 
-    const data = await res.json();
-    const hexPrice = data.result;
-    if (!hexPrice) throw new Error("No result from eth_gasPrice");
+      const data = await res.json();
+      const hexPrice = data.result;
+      if (!hexPrice) throw new Error("No result from eth_gasPrice");
 
-    const priceWei = BigInt(hexPrice);
+      const priceWei = BigInt(hexPrice);
 
-    // Cache it
-    gasPriceCache.set(chainId, { priceWei, fetchedAt: now });
+      // Cache it
+      gasPriceCache.set(chainId, { priceWei, fetchedAt: now });
 
-    return { priceWei, isFallback: false };
-  } catch (err) {
-    console.error(`[gas-estimator] eth_gasPrice failed for chain ${chainId}:`, (err as Error).message);
-    // Fallback
-    const fallbackGwei = FALLBACK_GAS_PRICE_GWEI[chainId];
-    if (fallbackGwei === undefined) return null; // Unknown chain, RPC failed
-    return { priceWei: BigInt(Math.round(fallbackGwei * 1e9)), isFallback: true };
+      return { priceWei, isFallback: false };
+    } catch (err) {
+      lastError = err as Error;
+      // Try next RPC
+    }
   }
+
+  console.error(`[gas-estimator] eth_gasPrice failed for chain ${chainId} (tried ${rpcUrls.length} RPCs):`, lastError?.message);
+  // All RPCs failed — use fallback
+  const fallbackGwei = FALLBACK_GAS_PRICE_GWEI[chainId];
+  if (fallbackGwei === undefined) return null;
+  return { priceWei: BigInt(Math.round(fallbackGwei * 1e9)), isFallback: true };
 }
 
 /**

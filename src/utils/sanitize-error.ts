@@ -25,6 +25,15 @@ export function sanitizeError(err: Error): string {
   // Strip hex data dumps (long hex strings > 20 chars)
   msg = msg.replace(/0x[a-fA-F0-9]{20,}/g, "[hex-data]");
 
+  // Strip bare hex private keys (64 hex chars not prefixed with 0x)
+  msg = msg.replace(/\b[a-fA-F0-9]{64}\b/g, "[key-redacted]");
+
+  // Strip mnemonic phrases (sequences of 12+ lowercase words that look like BIP-39)
+  msg = msg.replace(/\b([a-z]{3,8}\s+){11,23}[a-z]{3,8}\b/g, "[mnemonic-redacted]");
+
+  // Strip base58 strings (Solana private keys are 44-88 base58 chars)
+  msg = msg.replace(/[1-9A-HJ-NP-Za-km-z]{43,88}/g, "[key-redacted]");
+
   // Truncate overly long messages
   if (msg.length > 300) {
     msg = msg.slice(0, 297) + "...";

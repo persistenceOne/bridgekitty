@@ -6,7 +6,7 @@ import { PersistenceBackend } from "./backends/persistence.js";
 import { DeBridgeBackend } from "./backends/debridge.js";
 import { RelayBackend } from "./backends/relay.js";
 import { AcrossBackend } from "./backends/across.js";
-import { SquidBackend } from "./backends/squid.js";
+import { SkipBackend } from "./backends/skip.js";
 import { RoutingEngine } from "./routing/engine.js";
 import { CircuitBreaker } from "./utils/circuit-breaker.js";
 import { registerGetQuote } from "./tools/get-quote.js";
@@ -14,8 +14,8 @@ import { registerExecuteBridge } from "./tools/execute-bridge.js";
 import { registerCheckStatus } from "./tools/check-status.js";
 import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
-import { registerPersistenceEarnTools } from "./tools/persistence-rewards.js";
-import { registerWalletTools } from "./tools/wallet.js";
+import { registerXprtFarmTools } from "./tools/xprt-farm.js";
+import { registerWalletTools, getKey } from "./tools/wallet.js";
 import * as fs from "fs";
 import * as path from "path";
 // Auto-load .env from CWD
@@ -49,9 +49,12 @@ function loadDotEnv() {
     }
 }
 loadDotEnv();
-/**
- * Create the shared routing engine (used by both MCP and ACP modes).
- */
+// MEDIUM-002: Immediately move sensitive keys from process.env to in-memory store.
+// loadDotEnv puts everything into process.env; calling getKey() moves them to the
+// in-memory keyStore and deletes from process.env, minimizing the exposure window.
+getKey("privateKey");
+getKey("mnemonic");
+getKey("solanaKey");
 // ─── BridgeKitty fee configuration (hardcoded — not user-configurable) ────────
 // These are the BridgeKitty project's integrator/affiliate addresses.
 // Revenue from bridge fees funds ongoing development.
@@ -62,21 +65,17 @@ const BRIDGEKITTY_LIFI_FEE = undefined; // needs portal.li.fi registration first
 const BRIDGEKITTY_LIFI_INTEGRATOR = undefined; // needs portal.li.fi registration first
 const BRIDGEKITTY_RELAY_FEE = "10"; // 10 bps = 0.1% app fee
 function createEngine() {
-    // Initialize backends with hardcoded BridgeKitty fee config
-    const lifi = new LiFiBackend(process.env.LIFI_API_KEY, // user can provide their own LI.FI API key for higher rate limits
-    BRIDGEKITTY_LIFI_INTEGRATOR, BRIDGEKITTY_LIFI_FEE);
+    const lifi = new LiFiBackend(process.env.LIFI_API_KEY, BRIDGEKITTY_LIFI_INTEGRATOR, BRIDGEKITTY_LIFI_FEE);
     const persistence = new PersistenceBackend();
     const debridge = new DeBridgeBackend(BRIDGEKITTY_DEBRIDGE_FEE, BRIDGEKITTY_FEE_WALLET);
     const relay = new RelayBackend(BRIDGEKITTY_FEE_WALLET, BRIDGEKITTY_RELAY_FEE);
     const across = new AcrossBackend(BRIDGEKITTY_FEE_WALLET);
-    const squid = new SquidBackend();
+    const skip = new SkipBackend(process.env.SKIP_API_KEY);
     const circuitBreaker = new CircuitBreaker();
-    return new RoutingEngine([lifi, persistence, debridge, relay, across, squid], circuitBreaker);
+    return new RoutingEngine([lifi, persistence, debridge, relay, across, skip], circuitBreaker);
 }
-/**
- * Start MCP stdio server (default mode).
- */
-async function startMcpServer(engine) {
+async function main() {
+    const engine = createEngine();
     const server = new McpServer({
         name: "bridgekitty",
         version: "0.1.0",
@@ -87,50 +86,10 @@ async function startMcpServer(engine) {
     registerGetChains(server, engine);
     registerGetTokens(server, engine);
     registerWalletTools(server);
-    registerPersistenceEarnTools(server, engine);
+    registerXprtFarmTools(server, engine);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("BridgeKitty 🐱 MCP server running on stdio");
-}
-/**
- * Start ACP listener mode.
- */
-async function startAcpListener(engine) {
-    // Dynamic import to avoid loading ACP SDK in MCP mode
-    const { AcpListener, loadAcpConfig, printRegistrationGuide } = await import("./acp/index.js");
-    const config = loadAcpConfig();
-    printRegistrationGuide(config.servicePriceUsd);
-    const listener = new AcpListener(config, engine);
-    // Graceful shutdown
-    const shutdown = async () => {
-        await listener.shutdown();
-        process.exit(0);
-    };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-    await listener.start();
-}
-// ─── CLI Entry Point ─────────────────────────────────────────────────────────
-const args = process.argv.slice(2);
-const mode = args.includes("--acp") ? "acp"
-    : args.includes("--register") ? "register"
-        : "mcp";
-async function main() {
-    const engine = createEngine();
-    switch (mode) {
-        case "acp":
-            await startAcpListener(engine);
-            break;
-        case "register": {
-            const { printRegistrationGuide } = await import("./acp/index.js");
-            const priceUsd = parseFloat(process.env.ACP_SERVICE_PRICE_USD ?? "0.20");
-            printRegistrationGuide(priceUsd);
-            break;
-        }
-        default:
-            await startMcpServer(engine);
-            break;
-    }
 }
 main().catch((err) => {
     console.error("Fatal error:", err);

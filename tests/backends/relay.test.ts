@@ -72,6 +72,7 @@ describe("RelayBackend", () => {
         details: {
           currencyIn: { currency: { symbol: "USDC", decimals: 6 }, amount: "100000000" },
           currencyOut: { currency: { symbol: "USDC", decimals: 6 }, amount: "99800000" },
+          gasFee: { usd: "0.05" },
           totalFee: { usd: "0.20" },
           timeEstimate: 30,
         },
@@ -84,7 +85,7 @@ describe("RelayBackend", () => {
     expect(quote!.backendName).toBe("relay");
     expect(quote!.provider).toContain("Relay");
     expect(quote!.outputAmountRaw).toBe("99800000");
-    expect(quote!.estimatedFeeUsd).toBeCloseTo(0.2, 1);
+    expect(quote!.estimatedFeeUsd).toBeCloseTo(0.25, 1);
     expect(quote!.estimatedTimeSeconds).toBe(30);
   });
 

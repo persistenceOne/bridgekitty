@@ -475,7 +475,7 @@ export class PersistenceBackend implements BridgeBackend {
 
     // Step 1: Prepare the order
     console.log("[persistence] Step 1: Preparing cross-chain order...");
-    const prepared = await this.prepareOrder(quote, swapperAddress);
+    let prepared = await this.prepareOrder(quote, swapperAddress);
 
     // Step 2: Check and set Permit2 allowance
     console.log("[persistence] Step 2: Checking Permit2 allowance...");
@@ -493,19 +493,19 @@ export class PersistenceBackend implements BridgeBackend {
 
     // Step 3: Sign EIP-712 typed data
     console.log("[persistence] Step 3: Signing EIP-712 typed data...");
-    const signature = await connectedSigner.signTypedData(
+    let signature = await connectedSigner.signTypedData(
       prepared.eip712Domain,
       prepared.eip712Types,
       prepared.eip712Value,
     );
-    console.log(`[persistence] Signature: ${signature.slice(0, 20)}...`);
+    console.log("[persistence] Signature obtained.");
 
-    // Step 4: Initiate on-chain
+    // Step 4: Initiate on-chain (with nonce-collision retry)
     console.log("[persistence] Step 4: Initiating on-chain...");
     const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, connectedSigner);
     const fillerData = ethers.zeroPadValue("0x", 32);
 
-    const orderTuple = [
+    let orderTuple: any[] = [
       prepared.order.settlementContract,
       prepared.order.swapper,
       prepared.order.nonce,
@@ -515,29 +515,73 @@ export class PersistenceBackend implements BridgeBackend {
       prepared.order.orderData,
     ];
 
-    let initiateTx: ethers.ContractTransactionResponse;
+    let initiateTx!: ethers.ContractTransactionResponse;
     let receipt: ethers.ContractTransactionReceipt | null;
-    try {
-      initiateTx = await settlement.initiate(orderTuple, signature, fillerData);
-      console.log(`[persistence] Initiate tx: ${initiateTx.hash}`);
-      receipt = await initiateTx.wait();
-      console.log(`[persistence] Confirmed in block ${receipt?.blockNumber}`);
-    } catch (initiateError) {
-      // HIGH-001 + HIGH-002: Revoke Permit2 approval on failed initiate
-      console.warn(
-        `[persistence] initiate() failed. Revoking Permit2 ERC20 approval. ` +
-        `Note: the EIP-712 signature may be replayable until the deadline expires ` +
-        `(${prepared.order.initiateDeadline}). Deadline is limited to 10 minutes.`
-      );
+    const MAX_NONCE_RETRIES = 2;
+    let lastInitiateError: unknown = null;
+
+    for (let attempt = 0; attempt <= MAX_NONCE_RETRIES; attempt++) {
       try {
-        const revokeTx = await erc20.approve(PERMIT2_ADDRESS, 0);
-        await revokeTx.wait();
-        console.log("[persistence] Permit2 approval revoked (set to 0).");
-      } catch (revokeError) {
-        console.error(`[persistence] Failed to revoke Permit2 approval: ${(revokeError as Error).message}`);
+        if (attempt > 0) {
+          // Re-prepare with fresh nonce from the contract
+          console.log(`[persistence] Retry ${attempt}/${MAX_NONCE_RETRIES}: preparing fresh order with new nonce...`);
+          const freshPrepared = await this.prepareOrder(quote, swapperAddress);
+          prepared = freshPrepared;
+
+          // Re-sign with fresh nonce
+          const freshSignature = await connectedSigner.signTypedData(
+            freshPrepared.eip712Domain,
+            freshPrepared.eip712Types,
+            freshPrepared.eip712Value,
+          );
+          signature = freshSignature;
+
+          // Rebuild order tuple
+          orderTuple[0] = freshPrepared.order.settlementContract;
+          orderTuple[1] = freshPrepared.order.swapper;
+          orderTuple[2] = freshPrepared.order.nonce;
+          orderTuple[3] = freshPrepared.order.originChainId;
+          orderTuple[4] = freshPrepared.order.initiateDeadline;
+          orderTuple[5] = freshPrepared.order.fillDeadline;
+          orderTuple[6] = freshPrepared.order.orderData;
+          console.log(`[persistence] Fresh nonce: ${freshPrepared.order.nonce}`);
+        }
+
+        initiateTx = await settlement.initiate(orderTuple, signature, fillerData);
+        console.log(`[persistence] Initiate tx: ${initiateTx.hash}`);
+        receipt = await initiateTx.wait();
+        console.log(`[persistence] Confirmed in block ${receipt?.blockNumber}`);
+        lastInitiateError = null;
+        break; // Success — exit retry loop
+      } catch (initiateError) {
+        lastInitiateError = initiateError;
+        const errMsg = (initiateError as Error).message ?? "";
+        const isNonceError = errMsg.includes("NONCE_ALREADY_USED") ||
+          errMsg.includes("InvalidNonce") ||
+          errMsg.includes("nonce") ||
+          errMsg.includes("TRANSFER_FAILED");
+
+        if (isNonceError && attempt < MAX_NONCE_RETRIES) {
+          console.warn(`[persistence] initiate() failed with nonce/transfer error (attempt ${attempt + 1}), will retry with fresh nonce`);
+          continue;
+        }
+
+        // Final failure — revoke approval and throw
+        console.warn(
+          `[persistence] initiate() failed after ${attempt + 1} attempt(s). Revoking Permit2 ERC20 approval.`
+        );
+        try {
+          const revokeTx = await erc20.approve(PERMIT2_ADDRESS, 0);
+          await revokeTx.wait();
+          console.log("[persistence] Permit2 approval revoked (set to 0).");
+        } catch (revokeError) {
+          console.error(`[persistence] Failed to revoke Permit2 approval: ${(revokeError as Error).message}`);
+        }
+        throw initiateError;
       }
-      throw initiateError;
     }
+
+    if (lastInitiateError) throw lastInitiateError;
 
     // Step 5: Submit to backend
     console.log("[persistence] Step 5: Submitting to backend...");

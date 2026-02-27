@@ -136,7 +136,7 @@ export function registerWalletTools(server: McpServer) {
               },
               note: "⚠️ IMPORTANT: Back up your .env file NOW — it contains your private keys. If lost, your funds are unrecoverable. Store a copy in a secure location.",
               envPath,
-              nextStep: "Fund your EVM wallet to start bridging. Use persistence_rewards_prepare to join the XPRT rewards campaign.",
+              nextStep: "Fund your EVM wallet to start bridging. Use xprt_farm_prepare to start XPRT farming.",
             }, null, 2),
           }],
         };

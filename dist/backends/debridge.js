@@ -197,13 +197,18 @@ export class DeBridgeBackend {
         // deBridge API doesn't return allowanceTarget — use tx.to (the DlnSource contract)
         // as the spender for the ERC20 approval.
         // When prependOperatingExpenses=true, the contract pulls MORE than the user's input amount
-        // (input + operating expenses). Use the actual amount from estimation if available.
+        // (input + operating expenses). The estimation.srcChainTokenIn.amount includes expenses,
+        // but the exact tx-encoded amount can differ slightly due to gas price fluctuation
+        // between the estimation and tx encoding. Add a 5% buffer to prevent allowance failures.
         const approvalSpender = data.tx.allowanceTarget ?? data.tx.to;
         if (approvalSpender && p.srcChainTokenIn !== "0x0000000000000000000000000000000000000000") {
-            const actualInputAmount = data.estimation?.srcChainTokenIn?.amount ?? p.srcChainTokenInAmount;
+            const estimatedAmount = data.estimation?.srcChainTokenIn?.amount ?? p.srcChainTokenInAmount;
+            // Buffer the approval by 5% to account for operating expense fluctuation.
+            // This is still a per-transaction approval (not unlimited) — safe and scoped.
+            const approvalAmount = (BigInt(estimatedAmount) * 105n / 100n).toString();
             result.approvalTx = {
                 to: p.srcChainTokenIn,
-                data: buildApproveData(approvalSpender, actualInputAmount),
+                data: buildApproveData(approvalSpender, approvalAmount),
                 value: "0x0",
                 chainId: p.srcChainId,
             };

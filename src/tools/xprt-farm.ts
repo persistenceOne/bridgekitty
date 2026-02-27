@@ -5,6 +5,7 @@ import type { RoutingEngine } from "../routing/engine.js";
 import { PersistenceBackend } from "../backends/persistence.js";
 import { getKey } from "./wallet.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
+import { simulateTransaction } from "../utils/tx-simulator.js";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
@@ -51,11 +52,11 @@ function getMultiplierTier(xprtStaked: number): { tier: string; multiplier: stri
   return { tier: "Explorer", multiplier: "1x" };
 }
 
-export function registerPersistenceEarnTools(server: McpServer, engine: RoutingEngine) {
-  // ─── persistence_rewards_prepare ────────────────────────────────────────────
+export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) {
+  // ─── xprt_farm_prepare ─────────────────────────────────────────────────────
   server.tool(
-    "persistence_rewards_prepare",
-    "Convert ETH or other tokens to cbBTC and bridge gas to BSC, preparing your wallet for the Persistence XPRT rewards campaign.",
+    "xprt_farm_prepare",
+    "Convert ETH or other tokens to cbBTC and bridge gas to BSC, preparing your wallet for XPRT farming via Persistence Interop.",
     {
       amount: z.string().optional().describe("ETH amount to use (auto-detects balance if omitted)"),
     },
@@ -134,6 +135,9 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
           const backend = engine.getBackend(bestQuote.backendName);
           if (backend) {
             const tx = await backend.buildTransaction(bestQuote);
+            // Simulate before sending
+            const sim = await simulateTransaction(tx.chainId, { to: tx.to, data: tx.data, value: tx.value, from: walletAddress });
+            if (!sim.success) throw new Error(`Simulation failed: ${sim.error}`);
             const connectedSigner = signer.connect(new ethers.JsonRpcProvider(RPC_URLS[tx.chainId] ?? "https://mainnet.base.org"));
             const txResponse = await connectedSigner.sendTransaction({
               to: tx.to,
@@ -186,12 +190,11 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
                 value: tx.approvalTx.value,
               });
               await approvalResponse.wait();
-              // Re-fetch bridge tx after approval to get fresh nonce (Squid fix)
-              if (tx.needsPostApprovalBuild && "buildBridgeTransaction" in backend) {
-                tx = await (backend as any).buildBridgeTransaction(bestQuote);
-              }
             }
 
+            // Simulate before sending
+            const sim2 = await simulateTransaction(tx.chainId, { to: tx.to, data: tx.data, value: tx.value, from: walletAddress });
+            if (!sim2.success) throw new Error(`Simulation failed: ${sim2.error}`);
             const txResponse = await connectedSigner.sendTransaction({
               to: tx.to,
               data: tx.data,
@@ -216,17 +219,17 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
             wallet: walletAddress,
             gasReserve: `${gasReserve} ETH kept on Base`,
             steps,
-            nextStep: "Run persistence_rewards_start to start qualifying for rewards",
+            nextStep: "Run xprt_farm_start to begin XPRT farming",
           }, null, 2),
         }],
       };
     }
   );
 
-  // ─── persistence_rewards_start ───────────────────────────────────────────────
+  // ─── xprt_farm_start ────────────────────────────────────────────────────────
   server.tool(
-    "persistence_rewards_start",
-    "Start qualifying bridge activity for the Persistence XPRT rewards campaign. Runs automated BTC round-trip swaps between BSC and Base. Rewards are distributed daily as airdrops — not guaranteed income.",
+    "xprt_farm_start",
+    "Start XPRT farming by running automated BTC round-trip swaps between BSC and Base via Persistence Interop. Earn XPRT rewards distributed daily as airdrops — not guaranteed income.",
     {
       amount: z.string().default("0.00005").describe("BTC amount per leg (default 0.00005)"),
       rounds: z.number().default(10).describe("Number of round trips (default 10)"),
@@ -366,10 +369,10 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
     }
   );
 
-  // ─── persistence_rewards_status ────────────────────────────────────────
+  // ─── xprt_farm_status ───────────────────────────────────────────────────────
   server.tool(
-    "persistence_rewards_status",
-    "Check your Persistence rewards status: wallet link, BTC balances, current epoch reward pool. Rewards are estimated and change based on total participation.",
+    "xprt_farm_status",
+    "Check your XPRT farming status: wallet link, BTC balances, current epoch reward pool. Rewards are estimated and change based on total participation.",
     {},
     async () => {
       const privateKey = getKey("privateKey");
@@ -426,10 +429,10 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
     }
   );
 
-  // ─── persistence_rewards_boost ─────────────────────────────────────────────
+  // ─── xprt_farm_boost ────────────────────────────────────────────────────────
   server.tool(
-    "persistence_rewards_boost",
-    "Buy XPRT with any token and auto-stake for reward multiplier boost. One command to go from 1x to 2x or 5x multiplier.",
+    "xprt_farm_boost",
+    "Buy XPRT with any token and auto-stake for XPRT farming multiplier boost. One command to go from 1x to 2x or 5x multiplier.",
     {
       amount: z.string().describe("Amount of source token to swap (e.g. '0.1')"),
       token: z.string().default("ETH").describe("Source token symbol (default: ETH)"),
@@ -437,19 +440,15 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
       validatorAddress: z.string().optional().describe("Validator address to delegate to (auto-picks best if omitted)"),
     },
     async (params) => {
-      const privateKey = getKey("privateKey");
       const mnemonic = getKey("mnemonic");
-      if (!privateKey || !mnemonic) {
+      if (!mnemonic) {
         return {
-          content: [{ type: "text" as const, text: "PRIVATE_KEY and MNEMONIC required. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: "MNEMONIC required. Run wallet_setup first." }],
           isError: true,
         };
       }
 
-      const evmWallet = new ethers.Wallet(privateKey);
-      const evmAddress = evmWallet.address;
-
-      // Get persistence address
+      // Derive persistence address to show the user where to send XPRT
       let persistenceAddress: string;
       try {
         const { Secp256k1HdWallet } = await import("@cosmjs/amino");
@@ -463,263 +462,23 @@ export function registerPersistenceEarnTools(server: McpServer, engine: RoutingE
         };
       }
 
-      // Resolve source chain ID
-      const chainMap: Record<string, number> = { base: 8453, bsc: 56, ethereum: 1 };
-      const sourceChainId = chainMap[params.chain.toLowerCase()];
-      if (!sourceChainId) {
-        return {
-          content: [{ type: "text" as const, text: `Unknown chain: ${params.chain}. Supported: base, bsc, ethereum` }],
-          isError: true,
-        };
-      }
-
-      // Try to get a cross-chain swap quote via Squid (supports Cosmos chains)
-      // Persistence chain ID in Squid/Axelar is "persistence"
-      const sourceTokenAddress = params.token.toUpperCase() === "ETH" || params.token.toUpperCase() === "BNB"
-        ? "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
-        : params.token; // Assume it's a token address if not native
-
-      // Attempt Squid route to Persistence chain
-      let swapExecuted = false;
-      let swapTxHash: string | undefined;
-      const squidBackend = engine.getBackend("squid");
-
-      if (squidBackend) {
-        try {
-          // Squid uses Axelar chain names for Cosmos chains
-          // Try to get a quote — if Persistence isn't supported, this will fail gracefully
-          const amountRaw = ethers.parseEther(params.amount).toString();
-
-          // Squid's Cosmos support uses chain IDs like "persistence" for the Persistence chain
-          // and token denoms like "uxprt" for XPRT
-          // Since our QuoteParams expects numeric chainIds, and Squid's Cosmos support
-          // may use string chain IDs internally, we need to check if the backend can handle this.
-          // For now, we'll note this as a limitation.
-
-          // Try the quote — Squid may or may not support Persistence chain directly
-          const quote = await squidBackend.getQuote({
-            fromChainId: sourceChainId,
-            toChainId: 6532, // Persistence chain uses this as a placeholder — may not work
-            fromTokenAddress: sourceTokenAddress,
-            toTokenAddress: "uxprt",
-            amountRaw,
-            fromAddress: evmAddress,
-            toAddress: persistenceAddress,
-            preference: "cheapest" as const,
-          });
-
-          if (quote) {
-            let tx = await squidBackend.buildTransaction(quote);
-            const rpcUrl = RPC_URLS[sourceChainId] ?? "https://mainnet.base.org";
-            const connectedSigner = evmWallet.connect(new ethers.JsonRpcProvider(rpcUrl));
-
-            if (tx.approvalTx) {
-              const approvalResponse = await connectedSigner.sendTransaction({
-                to: tx.approvalTx.to,
-                data: tx.approvalTx.data,
-                value: tx.approvalTx.value,
-              });
-              await approvalResponse.wait();
-              // Re-fetch bridge tx after approval to get fresh nonce (Squid fix)
-              if (tx.needsPostApprovalBuild && "buildBridgeTransaction" in squidBackend) {
-                tx = await (squidBackend as any).buildBridgeTransaction(quote);
-              }
-            }
-
-            const txResponse = await connectedSigner.sendTransaction({
-              to: tx.to,
-              data: tx.data,
-              value: tx.value,
-              ...(tx.gasLimit ? { gasLimit: tx.gasLimit } : {}),
-            });
-            await txResponse.wait();
-            swapTxHash = txResponse.hash;
-            swapExecuted = true;
-          }
-        } catch {
-          // Squid doesn't support direct route to Persistence — fall through to manual instructions
-        }
-      }
-
-      if (!swapExecuted) {
-        // No direct route available — provide manual instructions
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "manual_required",
-              message: "Direct cross-chain swap to Persistence chain is not yet supported via BridgeKitty routing. To boost your multiplier:",
-              steps: [
-                `1. Buy XPRT on a CEX (Osmosis DEX, Gate.io, Huobi) or swap via Osmosis`,
-                `2. Send XPRT to your Persistence address: ${persistenceAddress}`,
-                `3. The tool will auto-detect and stake it — run persistence_rewards_boost again after funding`,
-              ],
-              persistenceAddress,
-              tiers: {
-                Explorer: "0 XPRT staked → 1x multiplier",
-                Voyager: "10,000 XPRT staked → 2x multiplier",
-                Pioneer: "1,000,000 XPRT staked → 5x multiplier",
-              },
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Wait for XPRT to arrive (poll balance for up to 5 minutes)
-      let xprtBalance = BigInt(0);
-      try {
-        const { Secp256k1HdWallet } = await import("@cosmjs/amino");
-        const cosmosWallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
-        const [account] = await cosmosWallet.getAccounts();
-
-        for (let i = 0; i < 30; i++) {
-          await new Promise(r => setTimeout(r, 10_000));
-          try {
-            const data = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${account.address}`);
-            const xprt = data.balances?.find((b: any) => b.denom === "uxprt");
-            if (xprt) {
-              xprtBalance = BigInt(xprt.amount);
-              if (xprtBalance > BigInt(0)) break;
-            }
-          } catch { /* retry */ }
-        }
-      } catch (err) {
-        return {
-          content: [{ type: "text" as const, text: `Swap submitted (tx: ${swapTxHash}) but failed to check balance: ${sanitizeError(err as Error)}` }],
-          isError: true,
-        };
-      }
-
-      if (xprtBalance === BigInt(0)) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "swap_pending",
-              swapTxHash,
-              message: "Swap submitted but XPRT hasn't arrived yet. It may take a few more minutes. Run this tool again to check and stake.",
-              persistenceAddress,
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Delegate XPRT to a validator
-      const gasReserve = BigInt(50_000); // 0.05 XPRT for gas
-      const delegateAmount = xprtBalance - gasReserve;
-
-      if (delegateAmount <= BigInt(0)) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `XPRT balance too low to stake after gas reserve. Balance: ${Number(xprtBalance) / 1e6} XPRT`,
-          }],
-          isError: true,
-        };
-      }
-
-      let validatorAddr = params.validatorAddress;
-      if (!validatorAddr) {
-        // Auto-pick validator with lowest commission and >1% voting power
-        try {
-          const data = await fetchJson(`${PERSISTENCE_REST}/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=200`);
-          const validators = data.validators ?? [];
-          const totalTokens = validators.reduce((sum: bigint, v: any) => sum + BigInt(v.tokens ?? "0"), BigInt(0));
-
-          const eligible = validators
-            .filter((v: any) => {
-              const votingPower = Number(BigInt(v.tokens ?? "0") * BigInt(10000) / totalTokens) / 100;
-              return votingPower > 1;
-            })
-            .sort((a: any, b: any) => {
-              const commA = parseFloat(a.commission?.commission_rates?.rate ?? "1");
-              const commB = parseFloat(b.commission?.commission_rates?.rate ?? "1");
-              return commA - commB;
-            });
-
-          if (eligible.length > 0) {
-            validatorAddr = eligible[0].operator_address;
-          }
-        } catch { /* fall through */ }
-      }
-
-      if (!validatorAddr) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "needs_validator",
-              swapTxHash,
-              xprtBalance: `${Number(xprtBalance) / 1e6} XPRT`,
-              message: "Could not auto-select a validator. Please provide a validatorAddress and run again.",
-              persistenceAddress,
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Delegate using cosmjs stargate
-      let delegateTxHash: string | undefined;
-      try {
-        const { SigningStargateClient } = await import("@cosmjs/stargate");
-        const { Registry } = await import("@cosmjs/proto-signing");
-        const { Secp256k1HdWallet } = await import("@cosmjs/amino");
-
-        const cosmosWallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
-        const [account] = await cosmosWallet.getAccounts();
-
-        const client = await SigningStargateClient.connectWithSigner(
-          "https://rpc.core.persistence.one",
-          cosmosWallet
-        );
-
-        const msg = {
-          typeUrl: "/cosmos.staking.v1beta1.MsgDelegate",
-          value: {
-            delegatorAddress: account.address,
-            validatorAddress: validatorAddr,
-            amount: { denom: "uxprt", amount: delegateAmount.toString() },
-          },
-        };
-
-        const fee = { amount: [{ denom: "uxprt", amount: "25000" }], gas: "250000" };
-        const result = await client.signAndBroadcast(account.address, [msg], fee, "BridgeKitty rewards boost");
-        delegateTxHash = result.transactionHash;
-      } catch (err) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "delegation_failed",
-              swapTxHash,
-              xprtBalance: `${Number(xprtBalance) / 1e6} XPRT`,
-              error: sanitizeError(err as Error),
-              message: "XPRT received but delegation failed. You can try again or delegate manually.",
-              persistenceAddress,
-              validatorAddress: validatorAddr,
-            }, null, 2),
-          }],
-          isError: true,
-        };
-      }
-
-      const stakedXprt = Number(delegateAmount) / 1e6;
-      const tier = getMultiplierTier(stakedXprt);
-
+      // TODO: Add automated EVM → Persistence XPRT swap via Skip Protocol IBC route
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
-            status: "success",
-            swapTxHash,
-            delegateTxHash,
-            amountStaked: `${stakedXprt.toFixed(6)} XPRT`,
-            validator: validatorAddr,
-            multiplier: tier,
+            status: "manual_required",
+            message: "To boost your XPRT farming multiplier, acquire XPRT and send it to your Persistence address:",
+            steps: [
+              `1. Buy XPRT on Osmosis DEX, Gate.io, or Huobi`,
+              `2. Send XPRT to your Persistence address: ${persistenceAddress}`,
+              `3. Run xprt_farm_boost again after funding — it will auto-stake your XPRT`,
+            ],
+            persistenceAddress,
             tiers: {
-              Explorer: "0 XPRT → 1x",
-              Voyager: "10,000 XPRT → 2x",
-              Pioneer: "1,000,000 XPRT → 5x",
+              Explorer: "0 XPRT staked → 1x multiplier",
+              Voyager: "10,000 XPRT staked → 2x multiplier",
+              Pioneer: "1,000,000 XPRT staked → 5x multiplier",
             },
           }, null, 2),
         }],
