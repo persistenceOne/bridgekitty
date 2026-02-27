@@ -38,7 +38,7 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
       slippage: z
         .number()
         .default(0.005)
-        .describe("Max slippage tolerance (0.005 = 0.5%)"),
+        .describe("Max slippage tolerance (0.005 = 0.5%). Applied by backends during quoting; reserved for future per-execution override."),
     },
     async (params) => {
       const quote = engine.getCachedQuote(params.quoteId);
@@ -135,6 +135,7 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
         const response: Record<string, any> = {
           provider: txRequest.provider,
           trackingId: txRequest.trackingId,
+          slippage: params.slippage,
           transaction: {
             to: txRequest.to,
             data: txRequest.data,
@@ -190,6 +191,8 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
           content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
         };
       } catch (err) {
+        // Release lock on failure so the user can retry
+        executingQuotes.delete(params.quoteId);
         return {
           content: [
             {
@@ -198,10 +201,9 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
             },
           ],
         };
-      } finally {
-        // H-3: Always release the lock
-        executingQuotes.delete(params.quoteId);
       }
+      // H-3: Lock stays held on success — quote cannot be re-executed.
+      // Lock is only released on error (above) to allow retry.
     }
   );
 }

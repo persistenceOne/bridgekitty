@@ -73,6 +73,7 @@ function buildQuoteCacheKey(params) {
         params.fromTokenAddress.toLowerCase(),
         params.toTokenAddress.toLowerCase(),
         params.amountRaw,
+        params.fromAddress.toLowerCase(),
         params.preference,
     ].join(":");
 }

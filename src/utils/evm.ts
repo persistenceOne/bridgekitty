@@ -2,6 +2,8 @@
  * Shared EVM utilities used across multiple backends.
  */
 
+import { getAddress } from "ethers";
+
 /**
  * Build ERC20 approve(address spender, uint256 amount) calldata.
  */
@@ -39,7 +41,6 @@ export function isValidEvmAddress(address: string): boolean {
 
   // Mixed-case: validate EIP-55 checksum using ethers
   try {
-    const { getAddress } = require("ethers") as typeof import("ethers");
     const checksummed = getAddress(address.toLowerCase());
     if (checksummed !== address) {
       console.warn(

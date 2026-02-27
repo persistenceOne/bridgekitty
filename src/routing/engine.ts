@@ -106,6 +106,7 @@ function buildQuoteCacheKey(params: QuoteParams): string {
     params.fromTokenAddress.toLowerCase(),
     params.toTokenAddress.toLowerCase(),
     params.amountRaw,
+    params.fromAddress.toLowerCase(),
     params.preference,
   ].join(":");
 }

@@ -74,11 +74,22 @@ function createEngine() {
     const circuitBreaker = new CircuitBreaker();
     return new RoutingEngine([lifi, persistence, debridge, relay, across, skip], circuitBreaker);
 }
+// Read version from package.json to avoid duplication
+const PKG_VERSION = (() => {
+    try {
+        const pkgPath = new URL("../package.json", import.meta.url);
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+        return pkg.version ?? "0.1.0";
+    }
+    catch {
+        return "0.1.0";
+    }
+})();
 async function main() {
     const engine = createEngine();
     const server = new McpServer({
         name: "bridgekitty",
-        version: "0.1.0",
+        version: PKG_VERSION,
     });
     registerGetQuote(server, engine);
     registerExecuteBridge(server, engine);
@@ -92,6 +103,12 @@ async function main() {
     console.error("BridgeKitty 🐱 MCP server running on stdio");
 }
 main().catch((err) => {
-    console.error("Fatal error:", err);
+    // Sanitize fatal errors to avoid leaking keys/paths in crash output
+    const msg = err instanceof Error ? err.message : String(err);
+    const safeMsg = msg
+        .replace(/\/[\w./-]+\.(ts|js|json|env)/g, "[path]")
+        .replace(/0x[a-fA-F0-9]{20,}/g, "[hex-data]")
+        .replace(/\b[a-fA-F0-9]{64}\b/g, "[key-redacted]");
+    console.error("Fatal error:", safeMsg);
     process.exit(1);
 });

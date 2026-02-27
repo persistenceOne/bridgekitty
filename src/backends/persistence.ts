@@ -550,6 +550,9 @@ export class PersistenceBackend implements BridgeBackend {
         initiateTx = await settlement.initiate(orderTuple, signature, fillerData);
         console.log(`[persistence] Initiate tx: ${initiateTx.hash}`);
         receipt = await initiateTx.wait();
+        if (receipt && receipt.status === 0) {
+          throw new Error(`Initiate transaction reverted on-chain (block ${receipt.blockNumber})`);
+        }
         console.log(`[persistence] Confirmed in block ${receipt?.blockNumber}`);
         lastInitiateError = null;
         break; // Success — exit retry loop
@@ -593,7 +596,7 @@ export class PersistenceBackend implements BridgeBackend {
         body: JSON.stringify({
           settlementContract: prepared.order.settlementContract,
           swapper: swapperAddress,
-          nonce: Number(prepared.order.nonce),
+          nonce: prepared.order.nonce.toString(),
           originChainId: sourceChainId,
           initiateDeadline: Number(prepared.order.initiateDeadline),
           fillDeadline: Number(prepared.order.fillDeadline),

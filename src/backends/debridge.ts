@@ -9,7 +9,7 @@ import type {
 } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
 import { getBackendChainId, getAllChains } from "../utils/chains.js";
-import { buildApproveData } from "../utils/evm.js";
+import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 
 const BASE_URL = "https://api.dln.trade/v1.0";
@@ -223,7 +223,7 @@ export class DeBridgeBackend implements BridgeBackend {
     // but the exact tx-encoded amount can differ slightly due to gas price fluctuation
     // between the estimation and tx encoding. Add a 5% buffer to prevent allowance failures.
     const approvalSpender = data.tx.allowanceTarget ?? data.tx.to;
-    if (approvalSpender && p.srcChainTokenIn !== "0x0000000000000000000000000000000000000000") {
+    if (approvalSpender && !isNativeToken(p.srcChainTokenIn)) {
       const estimatedAmount = data.estimation?.srcChainTokenIn?.amount ?? p.srcChainTokenInAmount;
       // Buffer the approval by 5% to account for operating expense fluctuation.
       // This is still a per-transaction approval (not unlimited) — safe and scoped.

@@ -103,7 +103,7 @@ const FALLBACK_NATIVE_PRICE_USD: Record<number, number> = {
   59144: 1850, // ETH (Linea)
   534352: 1850,// ETH (Scroll)
   324: 1850,   // ETH (zkSync)
-  5000: 1850,  // MNT (Mantle)
+  5000: 0.60,  // MNT (Mantle)
   81457: 1850, // ETH (Blast)
 };
 

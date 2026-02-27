@@ -262,11 +262,12 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
       let consecutiveFailures = 0;
       let completedRounds = 0;
-      const totalFeesBps = 0;
+      let totalLossBps = 0;
+      const initialCbBTCRaw = BigInt(cbBTCRaw);
 
       for (let i = 0; i < params.rounds; i++) {
         if (consecutiveFailures >= params.maxFailures) break;
-        if (totalFeesBps >= params.maxLossBps) break;
+        if (totalLossBps >= params.maxLossBps) break;
 
         const roundResult: (typeof results)[number] = { round: i + 1 };
         let roundFailed = false;
@@ -336,6 +337,17 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           if (fulfilled) {
             completedRounds++;
             consecutiveFailures = 0;
+            // Track cumulative loss: check cbBTC balance vs initial per-round amount
+            try {
+              const cbBTCBalance = BigInt(await getBalance(8453, CBTCB_BASE, walletAddress));
+              // Calculate loss in basis points vs what we started this round with
+              if (initialCbBTCRaw > 0n) {
+                const roundLossBps = Number(
+                  ((initialCbBTCRaw - (cbBTCBalance < initialCbBTCRaw ? cbBTCBalance : initialCbBTCRaw)) * 10000n) / initialCbBTCRaw
+                );
+                if (roundLossBps > 0) totalLossBps += roundLossBps;
+              }
+            } catch { /* balance check failed — non-fatal, skip loss tracking */ }
           } else {
             consecutiveFailures++;
           }
@@ -359,8 +371,9 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             wallet: walletAddress,
             completedRounds,
             totalAttempted: results.length,
+            totalLossBps: totalLossBps,
             stoppedEarly: consecutiveFailures >= params.maxFailures ? "max consecutive failures" :
-              totalFeesBps >= params.maxLossBps ? "max loss threshold" : null,
+              totalLossBps >= params.maxLossBps ? "max loss threshold" : null,
             rounds: results,
             disclaimer: "Rewards are estimated and not guaranteed.",
           }, null, 2),

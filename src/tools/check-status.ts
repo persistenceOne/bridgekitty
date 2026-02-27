@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 
 export function registerCheckStatus(server: McpServer, engine: RoutingEngine) {
   server.tool(
@@ -29,6 +30,19 @@ export function registerCheckStatus(server: McpServer, engine: RoutingEngine) {
         .describe("Bridge provider (e.g. 'lifi', 'persistence')"),
     },
     async (params) => {
+      // Validate: at least one of trackingId or txHash must be provided
+      if (!params.trackingId && !params.txHash) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Please provide either a trackingId (from bridge_execute) or a txHash to check bridge status.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
       // Determine which backend to query
       let providerName = params.provider;
       if (!providerName && params.trackingId) {
@@ -48,29 +62,41 @@ export function registerCheckStatus(server: McpServer, engine: RoutingEngine) {
         };
       }
 
-      const meta: Record<string, string> = {};
-      if (params.txHash) meta.txHash = params.txHash;
-      if (params.fromChain) meta.fromChain = params.fromChain;
-      if (params.toChain) meta.toChain = params.toChain;
+      try {
+        const meta: Record<string, string> = {};
+        if (params.txHash) meta.txHash = params.txHash;
+        if (params.fromChain) meta.fromChain = params.fromChain;
+        if (params.toChain) meta.toChain = params.toChain;
 
-      const status = await backend.getStatus(
-        params.trackingId ?? params.txHash ?? "",
-        meta
-      );
+        const status = await backend.getStatus(
+          params.trackingId ?? params.txHash ?? "",
+          meta
+        );
 
-      const response = {
-        status: status.state,
-        summary: status.humanReadable,
-        provider: status.provider,
-        sourceTx: status.sourceTxHash ?? null,
-        destinationTx: status.destTxHash ?? null,
-        elapsedSeconds: status.elapsed,
-        estimatedRemainingSeconds: status.estimatedRemaining ?? null,
-      };
+        const response = {
+          status: status.state,
+          summary: status.humanReadable,
+          provider: status.provider,
+          sourceTx: status.sourceTxHash ?? null,
+          destinationTx: status.destTxHash ?? null,
+          elapsedSeconds: status.elapsed,
+          estimatedRemainingSeconds: status.estimatedRemaining ?? null,
+        };
 
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
-      };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Status check failed: ${sanitizeError(err as Error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 }

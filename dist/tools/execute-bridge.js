@@ -23,7 +23,7 @@ export function registerExecuteBridge(server, engine) {
         slippage: z
             .number()
             .default(0.005)
-            .describe("Max slippage tolerance (0.005 = 0.5%)"),
+            .describe("Max slippage tolerance (0.005 = 0.5%). Applied by backends during quoting; reserved for future per-execution override."),
     }, async (params) => {
         const quote = engine.getCachedQuote(params.quoteId);
         if (!quote) {
@@ -106,6 +106,7 @@ export function registerExecuteBridge(server, engine) {
             const response = {
                 provider: txRequest.provider,
                 trackingId: txRequest.trackingId,
+                slippage: params.slippage,
                 transaction: {
                     to: txRequest.to,
                     data: txRequest.data,
@@ -157,6 +158,8 @@ export function registerExecuteBridge(server, engine) {
             };
         }
         catch (err) {
+            // Release lock on failure so the user can retry
+            executingQuotes.delete(params.quoteId);
             return {
                 content: [
                     {
@@ -166,9 +169,7 @@ export function registerExecuteBridge(server, engine) {
                 ],
             };
         }
-        finally {
-            // H-3: Always release the lock
-            executingQuotes.delete(params.quoteId);
-        }
+        // H-3: Lock stays held on success — quote cannot be re-executed.
+        // Lock is only released on error (above) to allow retry.
     });
 }

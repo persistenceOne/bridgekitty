@@ -106,13 +106,22 @@ export class SkipBackend implements BridgeBackend {
       // Check for warnings
       const warning = data.warning;
 
+      // Skip doesn't provide a separate minOutput — apply 0.5% slippage buffer
+      let minOutputRaw: string;
+      try {
+        const outputBig = BigInt(outputRaw);
+        minOutputRaw = (outputBig * 995n / 1000n).toString();
+      } catch {
+        minOutputRaw = outputRaw;
+      }
+
       return {
         backendName: "skip",
         provider: `Skip Router${warning ? ` (${warning.type ?? "warning"})` : ""}`,
         outputAmount: formatTokenAmount(outputRaw, decimals),
         outputAmountRaw: outputRaw,
-        minOutputAmount: formatTokenAmount(outputRaw, decimals),
-        minOutputAmountRaw: outputRaw,
+        minOutputAmount: formatTokenAmount(minOutputRaw, decimals),
+        minOutputAmountRaw: minOutputRaw,
         outputDecimals: decimals,
         estimatedGasCostUsd: null,
         estimatedFeeUsd: totalFeeUsd > 0 ? Math.round(totalFeeUsd * 100) / 100 : null,

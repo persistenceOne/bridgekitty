@@ -1,6 +1,6 @@
 import { formatTokenAmount } from "../utils/tokens.js";
 import { getAllChains } from "../utils/chains.js";
-import { NATIVE_ADDRESS } from "../utils/evm.js";
+import { buildApproveData, NATIVE_ADDRESS } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 const BASE_URL = "https://api.relay.link";
 const TIMEOUT_MS = 15_000;
@@ -136,9 +136,25 @@ export class RelayBackend {
             trackingId: `relay:${data.requestId ?? Date.now()}`,
         };
         if (approvalTx) {
+            // Validate: reject unlimited approvals from API (amount = MaxUint256)
+            // ERC20 approve calldata: 0x095ea7b3 + spender(32 bytes) + amount(32 bytes)
+            let approvalData = approvalTx.data;
+            if (typeof approvalData === "string" && approvalData.length === 138) {
+                const amountHex = approvalData.slice(74); // last 64 hex chars = amount
+                const MAX_UINT256_HEX = "f".repeat(64);
+                if (amountHex.toLowerCase() === MAX_UINT256_HEX) {
+                    // Relay sent unlimited approval — rebuild with exact amount from quote
+                    const inputAmount = data.details?.currencyIn?.amount;
+                    if (inputAmount) {
+                        const spender = "0x" + approvalData.slice(10, 74).replace(/^0+/, "");
+                        approvalData = buildApproveData(spender, inputAmount);
+                        console.warn("[relay] Replaced unlimited approval with exact amount");
+                    }
+                }
+            }
             result.approvalTx = {
                 to: approvalTx.to,
-                data: approvalTx.data,
+                data: approvalData,
                 value: "0x0",
                 chainId: approvalTx.chainId ?? result.chainId,
             };

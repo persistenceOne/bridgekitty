@@ -210,7 +210,7 @@ export class AcrossBackend implements BridgeBackend {
       qd.exclusiveRelayer ?? "0x0000000000000000000000000000000000000000",     // exclusiveRelayer
       qd.timestamp ?? Math.floor(Date.now() / 1000),                         // quoteTimestamp
       Math.floor(Date.now() / 1000) + 3600,                                  // fillDeadline (1 hour)
-      qd.exclusivityDeadline ?? 0,                                            // exclusivityDeadline
+      qd.exclusivityDeadline ?? 0,                                            // exclusivityDeadline (relative offset from quoteTimestamp, per Across V3 contract)
       "0x",                                                                   // message (empty)
     ]);
 
