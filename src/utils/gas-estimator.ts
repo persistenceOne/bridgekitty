@@ -40,19 +40,20 @@ const CHAIN_RPC_ENV_KEYS: Record<number, string> = {
 
 // Default public RPCs per chain with failover (used when env var not set)
 // Multiple endpoints per chain for reliability — tried in order on failure.
+// NOTE: Ankr free tier now requires API keys — removed. Using PublicNode + dRPC.
 const DEFAULT_CHAIN_RPCS: Record<number, string[]> = {
-  1: ["https://rpc.ankr.com/eth", "https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
-  10: ["https://rpc.ankr.com/optimism", "https://optimism-rpc.publicnode.com", "https://optimism.drpc.org"],
-  56: ["https://rpc.ankr.com/bsc", "https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"],
-  137: ["https://rpc.ankr.com/polygon", "https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
-  42161: ["https://rpc.ankr.com/arbitrum", "https://arbitrum-one-rpc.publicnode.com", "https://arbitrum.drpc.org"],
-  43114: ["https://rpc.ankr.com/avalanche", "https://avalanche-c-chain-rpc.publicnode.com"],
-  8453: ["https://rpc.ankr.com/base", "https://base-rpc.publicnode.com", "https://base.drpc.org"],
-  59144: ["https://rpc.ankr.com/linea", "https://linea-rpc.publicnode.com"],
-  534352: ["https://rpc.ankr.com/scroll", "https://scroll-rpc.publicnode.com"],
-  324: ["https://rpc.ankr.com/zksync_era", "https://zksync-era-rpc.publicnode.com"],
-  5000: ["https://rpc.ankr.com/mantle", "https://mantle-rpc.publicnode.com"],
-  81457: ["https://rpc.ankr.com/blast", "https://blast-rpc.publicnode.com"],
+  1: ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+  10: ["https://optimism-rpc.publicnode.com", "https://optimism.drpc.org"],
+  56: ["https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"],
+  137: ["https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
+  42161: ["https://arbitrum-one-rpc.publicnode.com", "https://arbitrum.drpc.org"],
+  43114: ["https://avalanche-c-chain-rpc.publicnode.com", "https://avax.drpc.org"],
+  8453: ["https://base-rpc.publicnode.com", "https://base.drpc.org"],
+  59144: ["https://linea-rpc.publicnode.com", "https://linea.drpc.org"],
+  534352: ["https://scroll-rpc.publicnode.com", "https://scroll.drpc.org"],
+  324: ["https://zksync-era-rpc.publicnode.com", "https://zksync.drpc.org"],
+  5000: ["https://mantle-rpc.publicnode.com", "https://mantle.drpc.org"],
+  81457: ["https://blast-rpc.publicnode.com", "https://blast.drpc.org"],
 };
 
 /** M-3: Validate that an RPC URL uses HTTPS (except localhost) */
@@ -79,29 +80,45 @@ export function getChainRpcUrl(chainId: number): string | undefined {
 }
 
 const PROVIDER_TIMEOUT_MS = 8_000;
+const PROVIDER_CACHE_TTL_MS = 60_000; // Cache working providers for 60s
+
+// Provider cache: avoids creating new JsonRpcProviders (and zombie retry loops) on every call
+const providerCache = new Map<number, { provider: ethers.JsonRpcProvider; fetchedAt: number }>();
 
 /**
  * Get a working JsonRpcProvider for a chain, trying multiple RPCs with failover.
- * Tries each configured RPC in order with a health check (getBlockNumber).
+ * Caches the working provider for 60s to avoid repeated connection overhead.
+ * Destroys failed providers to prevent ethers.js background retry loops.
  * Throws if no RPC can be reached.
  */
 export async function getProvider(chainId: number): Promise<ethers.JsonRpcProvider> {
+  // Return cached provider if still fresh
+  const cached = providerCache.get(chainId);
+  if (cached && Date.now() - cached.fetchedAt < PROVIDER_CACHE_TTL_MS) {
+    return cached.provider;
+  }
+
   const urls = getChainRpcUrls(chainId);
   if (urls.length === 0) throw new Error(`No RPC configured for chain ${chainId}`);
 
   let lastError: Error | null = null;
   for (const url of urls) {
+    const provider = new ethers.JsonRpcProvider(url);
     try {
-      const provider = new ethers.JsonRpcProvider(url);
       await Promise.race([
         provider.getBlockNumber(),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("RPC timeout")), PROVIDER_TIMEOUT_MS)
         ),
       ]);
+      // Cache the working provider
+      providerCache.set(chainId, { provider, fetchedAt: Date.now() });
       return provider;
     } catch (err) {
       lastError = err as Error;
+      // Destroy failed provider to stop ethers.js internal retry loop
+      // (prevents "retry in 1s" messages flooding stderr indefinitely)
+      provider.destroy();
     }
   }
   throw new Error(`All ${urls.length} RPCs failed for chain ${chainId}: ${lastError?.message}`);
