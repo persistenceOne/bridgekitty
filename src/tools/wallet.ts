@@ -266,4 +266,155 @@ export function registerWalletTools(server: McpServer) {
       };
     }
   );
+
+  // ─── wallet_import ──────────────────────────────────────────────────────
+  server.tool(
+    "wallet_import",
+    "Import an existing mnemonic and/or private key. At least one required. Mnemonic gives EVM + Persistence + Solana; privateKey alone gives EVM only.",
+    {
+      mnemonic: z.string().optional().describe("12 or 24 word BIP-39 mnemonic phrase"),
+      privateKey: z.string().optional().describe("0x-prefixed hex EVM private key"),
+      overwrite: z.boolean().default(false).describe("Set true to overwrite existing keys (back up first!)"),
+    },
+    async (params) => {
+      try {
+        // Validate: at least one must be provided
+        if (!params.mnemonic && !params.privateKey) {
+          return {
+            content: [{ type: "text" as const, text: "ERROR: Provide at least one of 'mnemonic' or 'privateKey'." }],
+            isError: true,
+          };
+        }
+
+        // Validate privateKey format
+        let evmAddress: string | undefined;
+        if (params.privateKey) {
+          if (!/^0x[a-fA-F0-9]{64}$/.test(params.privateKey)) {
+            return {
+              content: [{ type: "text" as const, text: "ERROR: privateKey must be 0x-prefixed followed by 64 hex characters." }],
+              isError: true,
+            };
+          }
+          try {
+            evmAddress = new ethers.Wallet(params.privateKey).address;
+          } catch (e) {
+            return {
+              content: [{ type: "text" as const, text: `ERROR: Invalid private key: ${sanitizeError(e as Error)}` }],
+              isError: true,
+            };
+          }
+        }
+
+        // Validate mnemonic
+        if (params.mnemonic) {
+          const words = params.mnemonic.trim().split(/\s+/);
+          if (words.length !== 12 && words.length !== 24) {
+            return {
+              content: [{ type: "text" as const, text: `ERROR: Mnemonic must be 12 or 24 words. Got ${words.length}.` }],
+              isError: true,
+            };
+          }
+          try {
+            ethers.Mnemonic.fromPhrase(params.mnemonic.trim());
+          } catch (e) {
+            return {
+              content: [{ type: "text" as const, text: `ERROR: Invalid BIP-39 mnemonic: ${sanitizeError(e as Error)}` }],
+              isError: true,
+            };
+          }
+        }
+
+        // C-1: Overwrite protection
+        const envPath = path.resolve(getConfigDir(), ".env");
+        if (!params.overwrite && fs.existsSync(envPath)) {
+          const existing = fs.readFileSync(envPath, "utf-8");
+          if (existing.includes("PRIVATE_KEY") || existing.includes("MNEMONIC")) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `ERROR: ${envPath} already contains keys. Pass overwrite=true to replace (back up first!).`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        // Derive addresses
+        const wallets: Record<string, any> = {};
+        let finalPrivateKey = params.privateKey;
+        const finalMnemonic = params.mnemonic?.trim();
+        let solanaPrivateKey: string | undefined;
+
+        if (finalMnemonic) {
+          // Derive EVM from mnemonic (only if no explicit privateKey)
+          if (!finalPrivateKey) {
+            const hdWallet = ethers.HDNodeWallet.fromMnemonic(
+              ethers.Mnemonic.fromPhrase(finalMnemonic),
+              "m/44'/60'/0'/0/0"
+            );
+            finalPrivateKey = hdWallet.privateKey;
+            evmAddress = hdWallet.address;
+          }
+
+          // Derive Persistence address
+          const { Secp256k1HdWallet } = await import("@cosmjs/amino");
+          const cosmosWallet = await Secp256k1HdWallet.fromMnemonic(finalMnemonic, { prefix: "persistence" });
+          const [cosmosAccount] = await cosmosWallet.getAccounts();
+          wallets.persistence = cosmosAccount.address;
+
+          // Derive Solana address
+          try {
+            const { Keypair } = await import("@solana/web3.js");
+            const { derivePath } = await import("ed25519-hd-key") as any;
+            const bip39 = await import("@scure/bip39") as any;
+            const seed = await bip39.mnemonicToSeed(finalMnemonic);
+            const derived = derivePath("m/44'/501'/0'/0'", Buffer.from(seed).toString("hex"));
+            const solanaKeypair = Keypair.fromSeed(derived.key);
+            const bs58 = await import("bs58");
+            solanaPrivateKey = bs58.default.encode(solanaKeypair.secretKey);
+            wallets.solana = solanaKeypair.publicKey.toBase58();
+          } catch (depErr) {
+            const msg = (depErr as Error).message || "";
+            if (msg.includes("Cannot find") || msg.includes("MODULE_NOT_FOUND") || msg.includes("ed25519-hd-key") || msg.includes("@scure/bip39")) {
+              wallets.solana = "skipped (install ed25519-hd-key @scure/bip39 for Solana support)";
+            } else {
+              throw depErr;
+            }
+          }
+        }
+
+        wallets.evm = { address: evmAddress, chains: Object.keys(EVM_CHAINS) };
+
+        // Write .env
+        let envContent = "";
+        if (finalMnemonic) envContent += `MNEMONIC=${finalMnemonic}\n`;
+        if (finalPrivateKey) envContent += `PRIVATE_KEY=${finalPrivateKey}\n`;
+        if (solanaPrivateKey) envContent += `SOLANA_PRIVATE_KEY=${solanaPrivateKey}\n`;
+
+        fs.writeFileSync(envPath, envContent, { mode: 0o600 });
+
+        // H-1: Update in-memory keyStore
+        if (finalPrivateKey) keyStore.privateKey = finalPrivateKey;
+        if (finalMnemonic) keyStore.mnemonic = finalMnemonic;
+        if (solanaPrivateKey) keyStore.solanaKey = solanaPrivateKey;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "imported",
+              wallets,
+              envPath,
+              note: "⚠️ Keys saved. Back up your .env file securely.",
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text" as const, text: `Import failed: ${sanitizeError(err as Error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

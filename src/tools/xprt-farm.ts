@@ -52,6 +52,59 @@ function getMultiplierTier(xprtStaked: number): { tier: string; multiplier: stri
   return { tier: "Explorer", multiplier: "1x" };
 }
 
+// ─── Dynamic amount clamping ─────────────────────────────────────────────────
+// Reads actual token balance, normalizes to 8-dec BTC, clamps to [MIN, MAX].
+// Same caps as PersistenceBackend.validateAmount (MIN_AMOUNT_RAW / MAX_AMOUNT_RAW).
+const MIN_BTC_8DEC = 5000n;      // 0.00005 BTC (matches persistence.ts MIN_AMOUNT_RAW)
+const MAX_BTC_8DEC = 100000n;    // 0.001 BTC (matches persistence.ts MAX_AMOUNT_RAW)
+
+interface ClampedAmount {
+  /** Raw amount string in the token's native decimals — ready for quote amountRaw */
+  amountRaw: string;
+  /** Normalized to 8-decimal BTC for logging / comparison */
+  btc8Dec: bigint;
+}
+
+async function getClampedAmount(
+  chainId: number,
+  tokenAddress: string,
+  walletAddress: string,
+  decimals: number,
+  userCapBtc?: number
+): Promise<ClampedAmount | null> {
+  const balanceRaw = BigInt(await getBalance(chainId, tokenAddress, walletAddress));
+  // Normalize to 8-decimal BTC (cbBTC is 8-dec, BTCB is 18-dec)
+  const balance8Dec = decimals > 8
+    ? balanceRaw / (10n ** BigInt(decimals - 8))
+    : balanceRaw;
+
+  if (balance8Dec < MIN_BTC_8DEC) return null; // Below minimum
+
+  let clamped = balance8Dec > MAX_BTC_8DEC ? MAX_BTC_8DEC : balance8Dec;
+  if (userCapBtc !== undefined) {
+    const cap8Dec = BigInt(Math.round(userCapBtc * 1e8));
+    if (cap8Dec < clamped) clamped = cap8Dec;
+  }
+  if (clamped < MIN_BTC_8DEC) clamped = MIN_BTC_8DEC;
+
+  // Convert back to native decimals for the quote
+  const amountRaw = decimals > 8
+    ? (clamped * (10n ** BigInt(decimals - 8))).toString()
+    : clamped.toString();
+
+  return { amountRaw, btc8Dec: clamped };
+}
+
+// ─── Leg configuration ────────────────────────────────────────────────────────
+interface LegConfig {
+  chainId: number;
+  destChainId: number;
+  token: string;
+  destToken: string;
+  decimals: number;
+  label: string;
+}
+
 export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) {
   // ─── xprt_farm_prepare ─────────────────────────────────────────────────────
   server.tool(
@@ -231,7 +284,8 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
     "xprt_farm_start",
     "Start XPRT farming by running automated BTC round-trip swaps between BSC and Base via Persistence Interop. Earn XPRT rewards distributed daily as airdrops — not guaranteed income.",
     {
-      amount: z.string().default("0.00005").describe("BTC amount per leg (default 0.00005)"),
+      amount: z.string().optional().describe("Max BTC amount per leg (e.g. '0.0003'). Omit to use full available balance each leg, clamped to protocol limits 0.00005–0.001 BTC."),
+      startFrom: z.enum(["base", "bsc"]).default("base").describe("Start from 'base' (cbBTC→BTCB) or 'bsc' (BTCB→cbBTC)"),
       rounds: z.number().default(10).describe("Number of round trips (default 10)"),
       delay: z.number().default(30).describe("Delay between rounds in seconds (default 30)"),
       maxFailures: z.number().default(3).describe("Stop after N consecutive failures (default 3)"),
@@ -250,20 +304,35 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       const walletAddress = signer.address;
       const persistence = new PersistenceBackend();
 
-      const amountBtc = parseFloat(params.amount);
-      const cbBTCRaw = Math.round(amountBtc * 1e8).toString();
-      const btcbRaw = ethers.parseUnits(params.amount, 18).toString();
+      // Parse optional user cap (in BTC)
+      const userCapBtc = params.amount ? parseFloat(params.amount) : undefined;
+
+      // Compute leg configs based on startFrom direction
+      const leg1: LegConfig = params.startFrom === "bsc"
+        ? { chainId: 56, destChainId: 8453, token: BTCB_BSC, destToken: CBTCB_BASE, decimals: 18, label: "BSC→Base" }
+        : { chainId: 8453, destChainId: 56, token: CBTCB_BASE, destToken: BTCB_BSC, decimals: 8, label: "Base→BSC" };
+      const leg2: LegConfig = params.startFrom === "bsc"
+        ? { chainId: 8453, destChainId: 56, token: CBTCB_BASE, destToken: BTCB_BSC, decimals: 8, label: "Base→BSC" }
+        : { chainId: 56, destChainId: 8453, token: BTCB_BSC, destToken: CBTCB_BASE, decimals: 18, label: "BSC→Base" };
 
       const results: Array<{
         round: number;
-        leg1?: { txHash: string; orderId: string; status: string };
-        leg2?: { txHash: string; orderId: string; status: string };
+        leg1?: { txHash: string; orderId: string; status: string; amountBtc?: string };
+        leg2?: { txHash: string; orderId: string; status: string; amountBtc?: string };
       }> = [];
 
       let consecutiveFailures = 0;
       let completedRounds = 0;
       let totalLossBps = 0;
-      const initialCbBTCRaw = BigInt(cbBTCRaw);
+
+      // Track loss using "home" chain balance (the chain we start from)
+      let initialHomeBalance8Dec: bigint | null = null;
+      try {
+        const homeBal = BigInt(await getBalance(leg1.chainId, leg1.token, walletAddress));
+        initialHomeBalance8Dec = leg1.decimals > 8
+          ? homeBal / (10n ** BigInt(leg1.decimals - 8))
+          : homeBal;
+      } catch { /* non-fatal */ }
 
       for (let i = 0; i < params.rounds; i++) {
         if (consecutiveFailures >= params.maxFailures) break;
@@ -272,19 +341,25 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
         const roundResult: (typeof results)[number] = { round: i + 1 };
         let roundFailed = false;
 
-        // Leg 1: Base → BSC (cbBTC → BTCB)
+        // ── Leg 1 ──────────────────────────────────────────────────────
         try {
+          const clamped1 = await getClampedAmount(
+            leg1.chainId, leg1.token, walletAddress, leg1.decimals, userCapBtc
+          );
+          if (!clamped1) throw new Error(`Balance below minimum 0.00005 BTC on ${leg1.label.split("→")[0]}`);
+
           const quote1 = await persistence.getQuote({
-            fromChainId: 8453,
-            toChainId: 56,
-            fromTokenAddress: CBTCB_BASE,
-            toTokenAddress: BTCB_BSC,
-            amountRaw: cbBTCRaw, fromAddress: walletAddress, preference: "cheapest" as const,
+            fromChainId: leg1.chainId, toChainId: leg1.destChainId,
+            fromTokenAddress: leg1.token, toTokenAddress: leg1.destToken,
+            amountRaw: clamped1.amountRaw, fromAddress: walletAddress, preference: "cheapest" as const,
           });
-          if (!quote1) throw new Error("No quote available for Base→BSC");
+          if (!quote1) throw new Error(`No quote available for ${leg1.label}`);
 
           const result1 = await persistence.signAndExecute(quote1, signer);
-          roundResult.leg1 = { txHash: result1.txHash, orderId: result1.orderId, status: "submitted" };
+          roundResult.leg1 = {
+            txHash: result1.txHash, orderId: result1.orderId, status: "submitted",
+            amountBtc: `${Number(clamped1.btc8Dec) / 1e8}`,
+          };
 
           let fulfilled = false;
           for (let w = 0; w < 30; w++) {
@@ -312,19 +387,25 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
         await new Promise(r => setTimeout(r, 5_000));
 
-        // Leg 2: BSC → Base (BTCB → cbBTC)
+        // ── Leg 2 ──────────────────────────────────────────────────────
         try {
+          const clamped2 = await getClampedAmount(
+            leg2.chainId, leg2.token, walletAddress, leg2.decimals, userCapBtc
+          );
+          if (!clamped2) throw new Error(`Balance below minimum 0.00005 BTC on ${leg2.label.split("→")[0]}`);
+
           const quote2 = await persistence.getQuote({
-            fromChainId: 56,
-            toChainId: 8453,
-            fromTokenAddress: BTCB_BSC,
-            toTokenAddress: CBTCB_BASE,
-            amountRaw: btcbRaw, fromAddress: walletAddress, preference: "cheapest" as const,
+            fromChainId: leg2.chainId, toChainId: leg2.destChainId,
+            fromTokenAddress: leg2.token, toTokenAddress: leg2.destToken,
+            amountRaw: clamped2.amountRaw, fromAddress: walletAddress, preference: "cheapest" as const,
           });
-          if (!quote2) throw new Error("No quote available for BSC→Base");
+          if (!quote2) throw new Error(`No quote available for ${leg2.label}`);
 
           const result2 = await persistence.signAndExecute(quote2, signer);
-          roundResult.leg2 = { txHash: result2.txHash, orderId: result2.orderId, status: "submitted" };
+          roundResult.leg2 = {
+            txHash: result2.txHash, orderId: result2.orderId, status: "submitted",
+            amountBtc: `${Number(clamped2.btc8Dec) / 1e8}`,
+          };
 
           let fulfilled = false;
           for (let w = 0; w < 30; w++) {
@@ -337,15 +418,19 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           if (fulfilled) {
             completedRounds++;
             consecutiveFailures = 0;
-            // Track cumulative loss: check cbBTC balance vs initial per-round amount
+            // Track cumulative loss: compare home-chain balance vs start
             try {
-              const cbBTCBalance = BigInt(await getBalance(8453, CBTCB_BASE, walletAddress));
-              // Calculate loss in basis points vs what we started this round with
-              if (initialCbBTCRaw > 0n) {
-                const roundLossBps = Number(
-                  ((initialCbBTCRaw - (cbBTCBalance < initialCbBTCRaw ? cbBTCBalance : initialCbBTCRaw)) * 10000n) / initialCbBTCRaw
-                );
-                if (roundLossBps > 0) totalLossBps += roundLossBps;
+              if (initialHomeBalance8Dec !== null && initialHomeBalance8Dec > 0n) {
+                const homeBal = BigInt(await getBalance(leg1.chainId, leg1.token, walletAddress));
+                const current8Dec = leg1.decimals > 8
+                  ? homeBal / (10n ** BigInt(leg1.decimals - 8))
+                  : homeBal;
+                if (current8Dec < initialHomeBalance8Dec) {
+                  const lossBps = Number(
+                    ((initialHomeBalance8Dec - current8Dec) * 10000n) / initialHomeBalance8Dec
+                  );
+                  totalLossBps = lossBps; // cumulative from start
+                }
               }
             } catch { /* balance check failed — non-fatal, skip loss tracking */ }
           } else {
@@ -369,9 +454,11 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           text: JSON.stringify({
             status: "completed",
             wallet: walletAddress,
+            direction: params.startFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base",
+            amountMode: userCapBtc ? `capped at ${userCapBtc} BTC` : "max available (clamped to 0.00005–0.001 BTC)",
             completedRounds,
             totalAttempted: results.length,
-            totalLossBps: totalLossBps,
+            totalLossBps,
             stoppedEarly: consecutiveFailures >= params.maxFailures ? "max consecutive failures" :
               totalLossBps >= params.maxLossBps ? "max loss threshold" : null,
             rounds: results,
