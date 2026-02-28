@@ -435,14 +435,30 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill on destination chain
+          // Poll for solver fill — dual strategy: status API + destination balance check.
+          // The status API may be unreliable (500/404), so we always verify via balance.
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+            // Strategy 1: Check status API
             const status = await persistence.getStatus(result1.trackingId, { orderId: result1.orderId });
             if (status.state === "completed") { fulfilled = true; break; }
             if (status.state === "failed") { legFailed = true; break; }
+
+            // Strategy 2: If status API is unreliable (unknown/404), check destination balance
+            if (status.state === "unknown" || status.state === "pending") {
+              try {
+                const currentDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+                if (currentDestBal > preDestBalance1) {
+                  fulfilled = true;
+                  progress(`Leg 1: fill confirmed via destination balance increase`);
+                  break;
+                }
+              } catch { /* non-fatal — balance check is best-effort */ }
+            }
+
             if ((w + 1) % 3 === 0) {
               progress(`Leg 1 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
@@ -456,38 +472,23 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg1.status = "failed: order rejected";
             roundFailed = true;
           } else {
-            // Timeout — source tx confirmed, but status API didn't report fill in time.
-            // Check destination balance — try immediately, then retry after a delay.
-            progress(`Leg 1 status API timed out — checking destination balance...`);
+            // Final fallback: one more balance check with 20s delay
+            progress(`Leg 1 polling exhausted — final balance check with 20s delay...`);
             let destVerified = false;
-
-            // First attempt — immediate
+            await new Promise(r => setTimeout(r, 20_000));
             try {
               const postDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
               if (postDestBal > preDestBalance1) {
                 destVerified = true;
-                progress(`Leg 1: destination balance increased — fill succeeded (status API was slow)`);
+                progress(`Leg 1: destination balance increased after final retry`);
               }
             } catch { /* non-fatal */ }
-
-            // Second attempt — wait 20s for fill to propagate, then check again
-            if (!destVerified) {
-              progress(`Leg 1: balance unchanged, waiting 20s for fill propagation...`);
-              await new Promise(r => setTimeout(r, 20_000));
-              try {
-                const retryBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
-                if (retryBal > preDestBalance1) {
-                  destVerified = true;
-                  progress(`Leg 1: destination balance increased after retry — fill succeeded`);
-                }
-              } catch { /* non-fatal */ }
-            }
 
             if (destVerified) {
               roundResult.leg1.status = "completed_late";
               hadTimeout = true;
             } else {
-              progress(`Leg 1 TIMEOUT — destination balance still unchanged after retry`);
+              progress(`Leg 1 TIMEOUT — destination balance still unchanged`);
               roundResult.leg1.status = "timeout";
               roundFailed = true;
               hadTimeout = true;
@@ -548,14 +549,29 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill on destination chain
+          // Poll for solver fill — dual strategy: status API + destination balance check.
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+            // Strategy 1: Check status API
             const status = await persistence.getStatus(result2.trackingId, { orderId: result2.orderId });
             if (status.state === "completed") { fulfilled = true; break; }
             if (status.state === "failed") { legFailed = true; break; }
+
+            // Strategy 2: If status API is unreliable (unknown/404), check destination balance
+            if (status.state === "unknown" || status.state === "pending") {
+              try {
+                const currentDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+                if (currentDestBal > preDestBalance2) {
+                  fulfilled = true;
+                  progress(`Leg 2: fill confirmed via destination balance increase`);
+                  break;
+                }
+              } catch { /* non-fatal — balance check is best-effort */ }
+            }
+
             if ((w + 1) % 3 === 0) {
               progress(`Leg 2 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
@@ -590,38 +606,24 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg2.status = "failed: order rejected";
             consecutiveFailures++;
           } else {
-            // Timeout — check destination balance — try immediately, then retry after delay
-            progress(`Leg 2 status API timed out — checking destination balance...`);
+            // Final fallback: one more balance check with 20s delay
+            progress(`Leg 2 polling exhausted — final balance check with 20s delay...`);
             let destVerified = false;
-
-            // First attempt — immediate
+            await new Promise(r => setTimeout(r, 20_000));
             try {
               const postDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
               if (postDestBal > preDestBalance2) {
                 destVerified = true;
-                progress(`Leg 2: destination balance increased — fill succeeded (status API was slow)`);
+                progress(`Leg 2: destination balance increased after final retry`);
               }
             } catch { /* non-fatal */ }
-
-            // Second attempt — wait 20s for fill to propagate, then check again
-            if (!destVerified) {
-              progress(`Leg 2: balance unchanged, waiting 20s for fill propagation...`);
-              await new Promise(r => setTimeout(r, 20_000));
-              try {
-                const retryBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
-                if (retryBal > preDestBalance2) {
-                  destVerified = true;
-                  progress(`Leg 2: destination balance increased after retry — fill succeeded`);
-                }
-              } catch { /* non-fatal */ }
-            }
 
             if (destVerified) {
               roundResult.leg2.status = "completed_late";
               await countRoundCompleted();
               hadTimeout = true;
             } else {
-              progress(`Leg 2 TIMEOUT — destination balance still unchanged after retry`);
+              progress(`Leg 2 TIMEOUT — destination balance still unchanged`);
               roundResult.leg2.status = "timeout";
               consecutiveFailures++;
               hadTimeout = true;
