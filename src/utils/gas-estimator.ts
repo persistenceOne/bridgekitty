@@ -2,6 +2,11 @@
  * Gas cost estimator for backends that don't provide gas fee estimates.
  * Uses chain-aware gas unit estimates + live gas price + native token USD price.
  *
+ * Also provides centralized RPC access with multi-endpoint failover:
+ *   getChainRpcUrls(chainId) — list of RPC URLs (env override → public defaults)
+ *   getChainRpcUrl(chainId)  — first URL only (backward compat, no failover)
+ *   getProvider(chainId)     — JsonRpcProvider with automatic failover across all RPCs
+ *
  * Strategy:
  * 1. Chain-aware gas units per backend type (L1 vs L2 differentiation)
  * 2. Live gas price via eth_gasPrice RPC (cached 30s)
@@ -9,6 +14,8 @@
  * 4. Calculate: gasUnits × gasPrice × nativeTokenPriceUSD
  * 5. If we can't reliably estimate → return null (displayed as "unknown")
  */
+
+import { ethers } from "ethers";
 
 const GAS_PRICE_CACHE_TTL_MS = 30_000; // 30 seconds
 const TOKEN_PRICE_CACHE_TTL_MS = 300_000; // 5 minutes
@@ -69,6 +76,35 @@ export function getChainRpcUrls(chainId: number): string[] {
 export function getChainRpcUrl(chainId: number): string | undefined {
   const urls = getChainRpcUrls(chainId);
   return urls.length > 0 ? urls[0] : undefined;
+}
+
+const PROVIDER_TIMEOUT_MS = 8_000;
+
+/**
+ * Get a working JsonRpcProvider for a chain, trying multiple RPCs with failover.
+ * Tries each configured RPC in order with a health check (getBlockNumber).
+ * Throws if no RPC can be reached.
+ */
+export async function getProvider(chainId: number): Promise<ethers.JsonRpcProvider> {
+  const urls = getChainRpcUrls(chainId);
+  if (urls.length === 0) throw new Error(`No RPC configured for chain ${chainId}`);
+
+  let lastError: Error | null = null;
+  for (const url of urls) {
+    try {
+      const provider = new ethers.JsonRpcProvider(url);
+      await Promise.race([
+        provider.getBlockNumber(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("RPC timeout")), PROVIDER_TIMEOUT_MS)
+        ),
+      ]);
+      return provider;
+    } catch (err) {
+      lastError = err as Error;
+    }
+  }
+  throw new Error(`All ${urls.length} RPCs failed for chain ${chainId}: ${lastError?.message}`);
 }
 
 // Native token address (used by LI.FI) — zero address for EVM chains

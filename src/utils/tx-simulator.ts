@@ -1,9 +1,10 @@
 /**
  * Transaction simulation via eth_estimateGas.
  * Verifies transactions won't revert before returning them to the user.
+ * Uses multi-RPC failover for reliability.
  */
 
-import { getChainRpcUrl } from "./gas-estimator.js";
+import { getChainRpcUrls } from "./gas-estimator.js";
 
 const SIMULATION_TIMEOUT_MS = 8_000;
 
@@ -20,15 +21,16 @@ export interface SimulationResult {
 /**
  * Simulate a transaction via eth_estimateGas.
  * Returns success/failure with gas estimate or error details.
+ * Tries multiple RPCs with failover for reliability.
  *
- * If RPC is unavailable, returns a warning rather than blocking the transaction.
+ * If all RPCs are unavailable, returns a warning rather than blocking the transaction.
  */
 export async function simulateTransaction(
   chainId: number,
   tx: { to: string; data: string; value: string; from?: string },
 ): Promise<SimulationResult> {
-  const rpcUrl = getChainRpcUrl(chainId);
-  if (!rpcUrl) {
+  const rpcUrls = getChainRpcUrls(chainId);
+  if (rpcUrls.length === 0) {
     console.warn(
       `[tx-simulator] MEDIUM-003: Simulation bypassed — no RPC configured for chainId=${chainId}. ` +
       `Transaction will proceed without pre-flight simulation.`,
@@ -39,105 +41,100 @@ export async function simulateTransaction(
     };
   }
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
+  // Build the eth_estimateGas params (reused across RPC attempts)
+  const txParam: Record<string, string> = {
+    to: tx.to,
+    data: tx.data,
+  };
+  if (tx.value && tx.value !== "0x0" && tx.value !== "0x00") {
+    txParam.value = tx.value.startsWith("0x") ? tx.value : `0x${BigInt(tx.value).toString(16)}`;
+  }
+  if (tx.from) {
+    txParam.from = tx.from;
+  }
 
-    // Build the eth_estimateGas params
-    const txParam: Record<string, string> = {
-      to: tx.to,
-      data: tx.data,
-    };
+  const requestBody = JSON.stringify({
+    jsonrpc: "2.0",
+    method: "eth_estimateGas",
+    params: [txParam],
+    id: 1,
+  });
 
-    // Handle value — normalize to hex
-    if (tx.value && tx.value !== "0x0" && tx.value !== "0x00") {
-      txParam.value = tx.value.startsWith("0x") ? tx.value : `0x${BigInt(tx.value).toString(16)}`;
-    }
+  // Try each RPC in order — return first definitive result
+  let lastWarning: string | undefined;
+  for (const rpcUrl of rpcUrls) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
 
-    // Use a generic sender if none provided
-    if (tx.from) {
-      txParam.from = tx.from;
-    }
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+        signal: controller.signal,
+      });
 
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "eth_estimateGas",
-        params: [txParam],
-        id: 1,
-      }),
-      signal: controller.signal,
-    });
+      clearTimeout(timer);
 
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      return {
-        success: true,
-        warning: `RPC returned ${res.status} during simulation — could not verify. Proceed with caution.`,
-      };
-    }
-
-    const data = await res.json();
-
-    if (data.error) {
-      // Parse the revert reason if available
-      const errorMsg = data.error.message ?? JSON.stringify(data.error);
-
-      // Common revert patterns
-      if (
-        errorMsg.includes("execution reverted") ||
-        errorMsg.includes("revert") ||
-        errorMsg.includes("UNPREDICTABLE_GAS_LIMIT")
-      ) {
-        return {
-          success: false,
-          error: `Transaction would revert: ${errorMsg.slice(0, 300)}`,
-        };
+      if (!res.ok) {
+        lastWarning = `RPC returned ${res.status} during simulation`;
+        continue; // Try next RPC
       }
 
-      // Insufficient funds is expected (we're simulating without the user's actual balance)
-      if (
-        errorMsg.includes("insufficient funds") ||
-        errorMsg.includes("insufficient balance")
-      ) {
+      const data = await res.json();
+
+      if (data.error) {
+        const errorMsg = data.error.message ?? JSON.stringify(data.error);
+
+        // Definitive revert — don't try other RPCs
+        if (
+          errorMsg.includes("execution reverted") ||
+          errorMsg.includes("revert") ||
+          errorMsg.includes("UNPREDICTABLE_GAS_LIMIT")
+        ) {
+          return {
+            success: false,
+            error: `Transaction would revert: ${errorMsg.slice(0, 300)}`,
+          };
+        }
+
+        // Insufficient funds is expected (simulating without user's actual balance)
+        if (
+          errorMsg.includes("insufficient funds") ||
+          errorMsg.includes("insufficient balance")
+        ) {
+          return {
+            success: true,
+            warning: "Could not fully simulate (insufficient balance in simulation) — transaction structure appears valid.",
+          };
+        }
+
+        // Other RPC-specific errors — try next RPC
+        lastWarning = `Simulation inconclusive: ${errorMsg.slice(0, 200)}`;
+        continue;
+      }
+
+      if (data.result) {
         return {
           success: true,
-          warning: "Could not fully simulate (insufficient balance in simulation) — transaction structure appears valid.",
+          estimatedGas: data.result,
         };
       }
 
-      // Other errors
-      return {
-        success: true,
-        warning: `Simulation inconclusive: ${errorMsg.slice(0, 200)}. Proceed with caution.`,
-      };
+      lastWarning = "Simulation returned no result";
+      continue;
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      lastWarning = errMsg.includes("abort")
+        ? "Simulation timed out"
+        : `Simulation failed: ${errMsg.slice(0, 200)}`;
+      continue; // Try next RPC
     }
-
-    if (data.result) {
-      return {
-        success: true,
-        estimatedGas: data.result,
-      };
-    }
-
-    return {
-      success: true,
-      warning: "Simulation returned no result — could not verify. Proceed with caution.",
-    };
-  } catch (err) {
-    const errMsg = (err as Error).message;
-    if (errMsg.includes("abort")) {
-      return {
-        success: true,
-        warning: "Simulation timed out — could not verify. Proceed with caution.",
-      };
-    }
-    return {
-      success: true,
-      warning: `Simulation failed: ${errMsg.slice(0, 200)}. Proceed with caution.`,
-    };
   }
+
+  // All RPCs exhausted without a definitive result
+  return {
+    success: true,
+    warning: `${lastWarning ?? "All RPCs failed"} (tried ${rpcUrls.length} RPCs). Proceed with caution.`,
+  };
 }

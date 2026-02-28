@@ -44,6 +44,7 @@ vi.mock("ethers", async () => {
 vi.mock("../../src/utils/gas-estimator.js", () => ({
   getGasUnits: () => 250_000,
   estimateGasCostUsd: async () => ({ costUsd: 0.10, usingFallbackPrices: false }),
+  getProvider: async () => ({ call: mockCall }),
 }));
 
 const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";

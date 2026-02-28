@@ -9,7 +9,7 @@ import type {
 } from "./types.js";
 import { BackendValidationError } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
-import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { estimateGasCostUsd, getGasUnits, getProvider } from "../utils/gas-estimator.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 
 /**
@@ -35,12 +35,6 @@ const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
-
-// RPC endpoints
-const RPC_URLS: Record<number, string> = {
-  8453: "https://mainnet.base.org",
-  56: "https://bsc-dataseed1.binance.org",
-};
 
 // EIP-712 types for Permit2 witness signing
 const PERMIT2_DOMAIN = {
@@ -315,10 +309,7 @@ export class PersistenceBackend implements BridgeBackend {
       throw new Error(`Unsupported chain pair: ${sourceChainId} → ${destChainId}`);
     }
 
-    const rpcUrl = RPC_URLS[sourceChainId];
-    if (!rpcUrl) throw new Error(`No RPC for chain ${sourceChainId}`);
-
-    const provider = new ethers.JsonRpcProvider(rpcUrl);
+    const provider = await getProvider(sourceChainId);
     const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, provider);
 
     const now = Math.floor(Date.now() / 1000);
@@ -466,11 +457,8 @@ export class PersistenceBackend implements BridgeBackend {
   ): Promise<{ txHash: string; orderId: string; trackingId: string }> {
     const data = quote.quoteData as any;
     const sourceChainId = data.sourceChainId ?? data.chainId ?? 8453;
-    const rpcUrl = RPC_URLS[sourceChainId];
-    if (!rpcUrl) throw new Error(`No RPC for chain ${sourceChainId}`);
-
     // Ensure signer is connected to the right chain
-    const provider = new ethers.JsonRpcProvider(rpcUrl);
+    const provider = await getProvider(sourceChainId);
     const connectedSigner = signer.connect(provider);
     const swapperAddress = await connectedSigner.getAddress();
 

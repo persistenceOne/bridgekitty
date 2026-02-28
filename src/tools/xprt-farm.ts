@@ -3,9 +3,11 @@ import { ethers } from "ethers";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
 import { PersistenceBackend } from "../backends/persistence.js";
-import { getKey } from "./wallet.js";
+import { getKey, getConfigDir } from "./wallet.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 import { simulateTransaction } from "../utils/tx-simulator.js";
+import { getProvider } from "../utils/gas-estimator.js";
+import * as path from "path";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
@@ -27,11 +29,6 @@ const ERC20_BALANCE_ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
-const RPC_URLS: Record<number, string> = {
-  8453: "https://mainnet.base.org",
-  56: "https://bsc-dataseed1.binance.org",
-};
-
 async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -48,7 +45,7 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
 }
 
 async function getBalance(chainId: number, tokenAddress: string, wallet: string): Promise<string> {
-  const provider = new ethers.JsonRpcProvider(RPC_URLS[chainId]);
+  const provider = await getProvider(chainId);
   const contract = new ethers.Contract(tokenAddress, ERC20_BALANCE_ABI, provider);
   const bal: bigint = await contract.balanceOf(wallet);
   return bal.toString();
@@ -124,8 +121,9 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
     async (params) => {
       const privateKey = getKey("privateKey");
       if (!privateKey) {
+        const envPath = path.resolve(getConfigDir(), ".env");
         return {
-          content: [{ type: "text" as const, text: "PRIVATE_KEY not set. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: `No wallet configured. Add keys to ${envPath} (MNEMONIC=... / PRIVATE_KEY=0x...) or run wallet_setup to generate new keys. Use wallet_status to check.` }],
           isError: true,
         };
       }
@@ -134,7 +132,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       const walletAddress = signer.address;
 
       // Check ETH balance on Base
-      const baseProvider = new ethers.JsonRpcProvider(RPC_URLS[8453]);
+      const baseProvider = await getProvider(8453);
       const ethBalance = await baseProvider.getBalance(walletAddress);
       const ethBalanceEth = parseFloat(ethers.formatEther(ethBalance));
 
@@ -199,7 +197,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             // Simulate before sending
             const sim = await simulateTransaction(tx.chainId, { to: tx.to, data: tx.data, value: tx.value, from: walletAddress });
             if (!sim.success) throw new Error(`Simulation failed: ${sim.error}`);
-            const connectedSigner = signer.connect(new ethers.JsonRpcProvider(RPC_URLS[tx.chainId] ?? "https://mainnet.base.org"));
+            const connectedSigner = signer.connect(await getProvider(tx.chainId));
             const txResponse = await connectedSigner.sendTransaction({
               to: tx.to,
               data: tx.data,
@@ -293,10 +291,10 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
     "Start XPRT farming by running automated BTC round-trip swaps between BSC and Base via Persistence Interop. Earn XPRT rewards distributed daily as airdrops — not guaranteed income.",
     {
       amount: z.string().optional().describe("Max BTC amount per leg (e.g. '0.0003'). Omit to use full available balance each leg, clamped to protocol limits 0.00005–0.001 BTC."),
-      startFrom: z.enum(["base", "bsc"]).default("base").describe("Start from 'base' (cbBTC→BTCB) or 'bsc' (BTCB→cbBTC)"),
+      startFrom: z.enum(["base", "bsc", "auto"]).default("auto").describe("'auto' (detect best direction), 'base' (cbBTC→BTCB), or 'bsc' (BTCB→cbBTC)"),
       rounds: z.number().default(10).describe("Number of round trips (default 10)"),
       delay: z.number().default(30).describe("Delay between rounds in seconds (default 30)"),
-      fillTimeout: z.number().default(180).describe("Max seconds to wait for each leg fill (default 180)"),
+      fillTimeout: z.number().default(180).describe("Max seconds to wait for each leg fill (default 180, minimum 90)"),
       maxFailures: z.number().default(3).describe("Stop after N consecutive failures (default 3)"),
       maxLossBps: z.number().default(200).describe("Stop if cumulative loss exceeds N basis points (default 200 = 2%)"),
     },
@@ -304,7 +302,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       const privateKey = getKey("privateKey");
       if (!privateKey) {
         return {
-          content: [{ type: "text" as const, text: "PRIVATE_KEY not set. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: `No wallet configured. Add keys to ${path.resolve(getConfigDir(), ".env")} (MNEMONIC=... / PRIVATE_KEY=0x...) or run wallet_setup to generate new keys. Use wallet_status to check.` }],
           isError: true,
         };
       }
@@ -315,14 +313,58 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
       // Parse optional user cap (in BTC)
       const userCapBtc = params.amount ? parseFloat(params.amount) : undefined;
-      const effectiveTimeout = Math.max(params.fillTimeout, 30); // minimum 30s
+      const effectiveTimeout = Math.max(params.fillTimeout, 90); // minimum 90s
       const maxPolls = Math.ceil((effectiveTimeout * 1000) / POLL_INTERVAL_MS);
 
-      // Compute leg configs based on startFrom direction
-      const leg1: LegConfig = params.startFrom === "bsc"
+      // Auto-detect best startFrom direction
+      let resolvedStartFrom: "base" | "bsc" = params.startFrom === "auto" ? "base" : params.startFrom;
+      if (params.startFrom === "auto") {
+        progress("Auto-detecting best direction...");
+        let baseBal: ClampedAmount | null = null;
+        let bscBal: ClampedAmount | null = null;
+        try { baseBal = await getClampedAmount(8453, CBTCB_BASE, walletAddress, 8, userCapBtc); } catch { /* non-fatal */ }
+        try { bscBal = await getClampedAmount(56, BTCB_BSC, walletAddress, 18, userCapBtc); } catch { /* non-fatal */ }
+
+        if (!baseBal && !bscBal) {
+          // Neither chain has enough — return detailed error with both balances
+          let baseRaw = "0", bscRaw = "0";
+          try { baseRaw = await getBalance(8453, CBTCB_BASE, walletAddress); } catch {}
+          try { bscRaw = await getBalance(56, BTCB_BSC, walletAddress); } catch {}
+          const baseHuman = (Number(baseRaw) / 1e8).toFixed(8);
+          const bscHuman = ethers.formatUnits(bscRaw, 18);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Insufficient BTC balance on both chains",
+                minimum: "0.00005 BTC per leg",
+                balances: {
+                  "Base cbBTC": `${baseHuman} BTC`,
+                  "BSC BTCB": `${bscHuman} BTC`,
+                },
+                action: "Run xprt_farm_prepare to convert ETH to cbBTC, or send BTC to your wallet.",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        if (baseBal && !bscBal) {
+          resolvedStartFrom = "base";
+        } else if (bscBal && !baseBal) {
+          resolvedStartFrom = "bsc";
+        } else {
+          // Both have balance — pick the one with more BTC
+          resolvedStartFrom = baseBal!.btc8Dec >= bscBal!.btc8Dec ? "base" : "bsc";
+        }
+        progress(`Auto-detected: starting from ${resolvedStartFrom} (${resolvedStartFrom === "base" ? "cbBTC" : "BTCB"})`);
+      }
+
+      // Compute leg configs based on resolved direction
+      const leg1: LegConfig = resolvedStartFrom === "bsc"
         ? { chainId: 56, destChainId: 8453, token: BTCB_BSC, destToken: CBTCB_BASE, decimals: 18, label: "BSC→Base" }
         : { chainId: 8453, destChainId: 56, token: CBTCB_BASE, destToken: BTCB_BSC, decimals: 8, label: "Base→BSC" };
-      const leg2: LegConfig = params.startFrom === "bsc"
+      const leg2: LegConfig = resolvedStartFrom === "bsc"
         ? { chainId: 8453, destChainId: 56, token: CBTCB_BASE, destToken: BTCB_BSC, decimals: 8, label: "Base→BSC" }
         : { chainId: 56, destChainId: 8453, token: BTCB_BSC, destToken: CBTCB_BASE, decimals: 18, label: "BSC→Base" };
 
@@ -345,7 +387,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           : homeBal;
       } catch { /* non-fatal */ }
 
-      const directionLabel = params.startFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base";
+      const directionLabel = resolvedStartFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base";
       progress(`Starting ${params.rounds} rounds, direction: ${directionLabel}, fillTimeout: ${effectiveTimeout}s`);
 
       for (let i = 0; i < params.rounds; i++) {
@@ -414,10 +456,12 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg1.status = "failed: order rejected";
             roundFailed = true;
           } else {
-            // Timeout — source tx confirmed, but status API didn't report fill.
-            // Check destination balance directly to verify if fill actually happened.
+            // Timeout — source tx confirmed, but status API didn't report fill in time.
+            // Check destination balance — try immediately, then retry after a delay.
             progress(`Leg 1 status API timed out — checking destination balance...`);
             let destVerified = false;
+
+            // First attempt — immediate
             try {
               const postDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
               if (postDestBal > preDestBalance1) {
@@ -426,11 +470,24 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
               }
             } catch { /* non-fatal */ }
 
+            // Second attempt — wait 20s for fill to propagate, then check again
+            if (!destVerified) {
+              progress(`Leg 1: balance unchanged, waiting 20s for fill propagation...`);
+              await new Promise(r => setTimeout(r, 20_000));
+              try {
+                const retryBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+                if (retryBal > preDestBalance1) {
+                  destVerified = true;
+                  progress(`Leg 1: destination balance increased after retry — fill succeeded`);
+                }
+              } catch { /* non-fatal */ }
+            }
+
             if (destVerified) {
               roundResult.leg1.status = "completed_late";
               hadTimeout = true;
             } else {
-              progress(`Leg 1 TIMEOUT — destination balance unchanged, fill may still be pending`);
+              progress(`Leg 1 TIMEOUT — destination balance still unchanged after retry`);
               roundResult.leg1.status = "timeout";
               roundFailed = true;
               hadTimeout = true;
@@ -533,9 +590,11 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg2.status = "failed: order rejected";
             consecutiveFailures++;
           } else {
-            // Timeout — check destination balance directly
+            // Timeout — check destination balance — try immediately, then retry after delay
             progress(`Leg 2 status API timed out — checking destination balance...`);
             let destVerified = false;
+
+            // First attempt — immediate
             try {
               const postDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
               if (postDestBal > preDestBalance2) {
@@ -544,12 +603,25 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
               }
             } catch { /* non-fatal */ }
 
+            // Second attempt — wait 20s for fill to propagate, then check again
+            if (!destVerified) {
+              progress(`Leg 2: balance unchanged, waiting 20s for fill propagation...`);
+              await new Promise(r => setTimeout(r, 20_000));
+              try {
+                const retryBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+                if (retryBal > preDestBalance2) {
+                  destVerified = true;
+                  progress(`Leg 2: destination balance increased after retry — fill succeeded`);
+                }
+              } catch { /* non-fatal */ }
+            }
+
             if (destVerified) {
               roundResult.leg2.status = "completed_late";
               await countRoundCompleted();
               hadTimeout = true;
             } else {
-              progress(`Leg 2 TIMEOUT — destination balance unchanged, fill may still be pending`);
+              progress(`Leg 2 TIMEOUT — destination balance still unchanged after retry`);
               roundResult.leg2.status = "timeout";
               consecutiveFailures++;
               hadTimeout = true;
@@ -606,7 +678,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       const privateKey = getKey("privateKey");
       if (!privateKey) {
         return {
-          content: [{ type: "text" as const, text: "PRIVATE_KEY not set. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: `No wallet configured. Add keys to ${path.resolve(getConfigDir(), ".env")} (MNEMONIC=... / PRIVATE_KEY=0x...) or run wallet_setup to generate new keys. Use wallet_status to check.` }],
           isError: true,
         };
       }
@@ -671,7 +743,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       const mnemonic = getKey("mnemonic");
       if (!mnemonic) {
         return {
-          content: [{ type: "text" as const, text: "MNEMONIC required. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: `No mnemonic configured. Add MNEMONIC to ${path.resolve(getConfigDir(), ".env")} or run wallet_setup to generate new keys. Use wallet_status to check.` }],
           isError: true,
         };
       }

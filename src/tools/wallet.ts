@@ -5,7 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { sanitizeError } from "../utils/sanitize-error.js";
-import { getChainRpcUrl } from "../utils/gas-estimator.js";
+import { getProvider } from "../utils/gas-estimator.js";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const TIMEOUT_MS = 15_000;
@@ -76,10 +76,62 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
 }
 
 export function registerWalletTools(server: McpServer) {
+  // ─── wallet_status ────────────────────────────────────────────────────────
+  server.tool(
+    "wallet_status",
+    "Check if a wallet is configured. Returns wallet address, key status, and config file location. Call this FIRST before wallet_setup or wallet_import.",
+    {},
+    async () => {
+      const configDir = getConfigDir();
+      const envPath = path.resolve(configDir, ".env");
+      const hasEnvFile = fs.existsSync(envPath);
+      const pk = getKey("privateKey");
+      const mn = getKey("mnemonic");
+      const sol = getKey("solanaKey");
+
+      if (pk) {
+        const address = new ethers.Wallet(pk).address;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "ready",
+              wallet: address,
+              hasPrivateKey: true,
+              hasMnemonic: !!mn,
+              hasSolanaKey: !!sol,
+              configFile: envPath,
+              chains: {
+                evm: Object.keys(EVM_CHAINS),
+                persistence: mn ? "available" : "unavailable (no mnemonic)",
+                solana: sol ? "available" : "unavailable (no solana key)",
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // No wallet loaded
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            status: "not_configured",
+            configFile: envPath,
+            configFileExists: hasEnvFile,
+            hint: hasEnvFile
+              ? `Config file exists at ${envPath} but no keys were loaded. Check format: MNEMONIC=word1 word2 ... and/or PRIVATE_KEY=0x...`
+              : `No wallet configured. Either: (1) run wallet_setup to generate a new wallet, or (2) add keys to ${envPath} with format: MNEMONIC=word1 word2 ... / PRIVATE_KEY=0x...`,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   // ─── wallet_setup ─────────────────────────────────────────────────────────
   server.tool(
     "wallet_setup",
-    "Create wallets for all supported chains (EVM, Cosmos, Solana) from a single mnemonic. Run this once — keys are saved to ~/.bridgekitty/.env.",
+    "Create wallets for all supported chains (EVM, Cosmos, Solana). Keys saved to ~/.bridgekitty/.env. Use wallet_status first to check if already configured.",
     {},
     async () => {
       try {
@@ -181,7 +233,7 @@ export function registerWalletTools(server: McpServer) {
   // ─── wallet_balance ───────────────────────────────────────────────────────
   server.tool(
     "wallet_balance",
-    "Check wallet balances across all chains (EVM, Cosmos, Solana).",
+    "Check wallet balances across all chains (EVM, Cosmos, Solana). Uses multiple RPCs with automatic failover.",
     {
       chains: z.array(z.string()).optional().describe("Chains to check (default: all). Options: ethereum, optimism, bsc, polygon, arbitrum, avalanche, base, linea, scroll, zksync, mantle, blast, persistence, solana"),
     },
@@ -191,8 +243,9 @@ export function registerWalletTools(server: McpServer) {
       const solanaKey = getKey("solanaKey");
 
       if (!privateKey) {
+        const envPath = path.resolve(getConfigDir(), ".env");
         return {
-          content: [{ type: "text" as const, text: "PRIVATE_KEY not set. Run wallet_setup first." }],
+          content: [{ type: "text" as const, text: `No wallet configured. Add keys to ${envPath} (MNEMONIC=... / PRIVATE_KEY=0x...) or run wallet_setup to generate new keys. Use wallet_status to check.` }],
           isError: true,
         };
       }
@@ -208,9 +261,7 @@ export function registerWalletTools(server: McpServer) {
 
       const evmResults = await Promise.allSettled(
         evmChains.map(async (chain) => {
-          const rpc = getChainRpcUrl(chain.chainId);
-          if (!rpc) throw new Error("no RPC configured");
-          const provider = new ethers.JsonRpcProvider(rpc);
+          const provider = await getProvider(chain.chainId);
           const bal = await provider.getBalance(evmAddress);
           return { name: chain.name, symbol: chain.symbol, balance: ethers.formatEther(bal) };
         })
@@ -270,7 +321,7 @@ export function registerWalletTools(server: McpServer) {
   // ─── wallet_import ──────────────────────────────────────────────────────
   server.tool(
     "wallet_import",
-    "Import an existing mnemonic and/or private key. At least one required. Mnemonic gives EVM + Persistence + Solana; privateKey alone gives EVM only.",
+    "Import existing keys. Alternative: edit ~/.bridgekitty/.env directly (MNEMONIC=<words>, PRIVATE_KEY=0x<hex>). Mnemonic gives EVM + Persistence + Solana; privateKey alone gives EVM only. Use wallet_status to check current state.",
     {
       mnemonic: z.string().optional().describe("12 or 24 word BIP-39 mnemonic phrase"),
       privateKey: z.string().optional().describe("0x-prefixed hex EVM private key"),
