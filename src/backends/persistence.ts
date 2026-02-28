@@ -560,13 +560,27 @@ export class PersistenceBackend implements BridgeBackend {
       } catch (initiateError) {
         lastInitiateError = initiateError;
         const errMsg = (initiateError as Error).message ?? "";
-        const isNonceError = errMsg.includes("NONCE_ALREADY_USED") ||
-          errMsg.includes("InvalidNonce") ||
-          errMsg.includes("nonce") ||
-          errMsg.includes("TRANSFER_FAILED");
 
-        if (isNonceError && attempt < MAX_NONCE_RETRIES) {
-          console.warn(`[persistence] initiate() failed with nonce/transfer error (attempt ${attempt + 1}), will retry with fresh nonce`);
+        // Distinguish nonce errors (retryable) from transfer/balance errors (not retryable)
+        const isTransferError = errMsg.includes("TRANSFER_FROM_FAILED") ||
+          errMsg.includes("TRANSFER_FAILED") ||
+          errMsg.includes("insufficient balance") ||
+          errMsg.includes("ERC20: transfer amount exceeds balance");
+
+        const isNonceError = !isTransferError && (
+          errMsg.includes("NONCE_ALREADY_USED") ||
+          errMsg.includes("InvalidNonce") ||
+          errMsg.includes("nonce too low") ||
+          errMsg.includes("nonce has already been used")
+        );
+
+        if (isTransferError) {
+          // Balance/allowance errors won't be fixed by a fresh nonce — fail immediately
+          console.warn(
+            `[persistence] initiate() failed with transfer/balance error (not retryable): ${errMsg.slice(0, 200)}`
+          );
+        } else if (isNonceError && attempt < MAX_NONCE_RETRIES) {
+          console.warn(`[persistence] initiate() failed with nonce error (attempt ${attempt + 1}), will retry with fresh nonce`);
           continue;
         }
 

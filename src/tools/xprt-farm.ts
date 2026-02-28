@@ -10,6 +10,14 @@ import { simulateTransaction } from "../utils/tx-simulator.js";
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
 const TIMEOUT_MS = 15_000;
+const POLL_INTERVAL_MS = 10_000;
+const POST_TIMEOUT_COOLDOWN_MS = 30_000; // Extra cooldown after timeouts for RPC propagation
+
+/** Write timestamped progress to stderr (visible in MCP clients as notifications) */
+function progress(msg: string): void {
+  const ts = new Date().toISOString().slice(11, 19); // HH:MM:SS
+  console.error(`[xprt-farm ${ts}] ${msg}`);
+}
 
 // Token addresses
 const CBTCB_BASE = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"; // cbBTC on Base (8 decimals)
@@ -288,6 +296,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       startFrom: z.enum(["base", "bsc"]).default("base").describe("Start from 'base' (cbBTC→BTCB) or 'bsc' (BTCB→cbBTC)"),
       rounds: z.number().default(10).describe("Number of round trips (default 10)"),
       delay: z.number().default(30).describe("Delay between rounds in seconds (default 30)"),
+      fillTimeout: z.number().default(180).describe("Max seconds to wait for each leg fill (default 180)"),
       maxFailures: z.number().default(3).describe("Stop after N consecutive failures (default 3)"),
       maxLossBps: z.number().default(200).describe("Stop if cumulative loss exceeds N basis points (default 200 = 2%)"),
     },
@@ -306,6 +315,8 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
       // Parse optional user cap (in BTC)
       const userCapBtc = params.amount ? parseFloat(params.amount) : undefined;
+      const effectiveTimeout = Math.max(params.fillTimeout, 30); // minimum 30s
+      const maxPolls = Math.ceil((effectiveTimeout * 1000) / POLL_INTERVAL_MS);
 
       // Compute leg configs based on startFrom direction
       const leg1: LegConfig = params.startFrom === "bsc"
@@ -334,19 +345,38 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           : homeBal;
       } catch { /* non-fatal */ }
 
-      for (let i = 0; i < params.rounds; i++) {
-        if (consecutiveFailures >= params.maxFailures) break;
-        if (totalLossBps >= params.maxLossBps) break;
+      const directionLabel = params.startFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base";
+      progress(`Starting ${params.rounds} rounds, direction: ${directionLabel}, fillTimeout: ${effectiveTimeout}s`);
 
+      for (let i = 0; i < params.rounds; i++) {
+        if (consecutiveFailures >= params.maxFailures) {
+          progress(`STOPPED: ${consecutiveFailures} consecutive failures (max: ${params.maxFailures})`);
+          break;
+        }
+        if (totalLossBps >= params.maxLossBps) {
+          progress(`STOPPED: cumulative loss ${totalLossBps} bps exceeds max ${params.maxLossBps}`);
+          break;
+        }
+
+        progress(`── Round ${i + 1}/${params.rounds} ──`);
         const roundResult: (typeof results)[number] = { round: i + 1 };
         let roundFailed = false;
+        let hadTimeout = false;
 
         // ── Leg 1 ──────────────────────────────────────────────────────
         try {
+          // Capture pre-leg destination balance for post-timeout verification
+          let preDestBalance1 = 0n;
+          try {
+            preDestBalance1 = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+          } catch { /* non-fatal */ }
+
           const clamped1 = await getClampedAmount(
             leg1.chainId, leg1.token, walletAddress, leg1.decimals, userCapBtc
           );
           if (!clamped1) throw new Error(`Balance below minimum 0.00005 BTC on ${leg1.label.split("→")[0]}`);
+
+          progress(`Leg 1 (${leg1.label}): ${Number(clamped1.btc8Dec) / 1e8} BTC`);
 
           const quote1 = await persistence.getQuote({
             fromChainId: leg1.chainId, toChainId: leg1.destChainId,
@@ -355,44 +385,97 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           });
           if (!quote1) throw new Error(`No quote available for ${leg1.label}`);
 
+          // signAndExecute waits for source tx confirmation — tokens leave wallet here
           const result1 = await persistence.signAndExecute(quote1, signer);
           roundResult.leg1 = {
             txHash: result1.txHash, orderId: result1.orderId, status: "submitted",
             amountBtc: `${Number(clamped1.btc8Dec) / 1e8}`,
           };
+          progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill...`);
 
+          // Poll for solver fill on destination chain
           let fulfilled = false;
-          for (let w = 0; w < 30; w++) {
-            await new Promise(r => setTimeout(r, 10_000));
+          let legFailed = false;
+          for (let w = 0; w < maxPolls; w++) {
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             const status = await persistence.getStatus(result1.trackingId, { orderId: result1.orderId });
             if (status.state === "completed") { fulfilled = true; break; }
-            if (status.state === "failed") break;
+            if (status.state === "failed") { legFailed = true; break; }
+            if ((w + 1) % 3 === 0) {
+              progress(`Leg 1 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
+            }
           }
-          if (!fulfilled) {
-            roundResult.leg1.status = "timeout";
+
+          if (fulfilled) {
+            progress(`Leg 1 COMPLETED`);
+            roundResult.leg1.status = "completed";
+          } else if (legFailed) {
+            progress(`Leg 1 FAILED — order rejected by solver`);
+            roundResult.leg1.status = "failed: order rejected";
             roundFailed = true;
           } else {
-            roundResult.leg1.status = "completed";
+            // Timeout — source tx confirmed, but status API didn't report fill.
+            // Check destination balance directly to verify if fill actually happened.
+            progress(`Leg 1 status API timed out — checking destination balance...`);
+            let destVerified = false;
+            try {
+              const postDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+              if (postDestBal > preDestBalance1) {
+                destVerified = true;
+                progress(`Leg 1: destination balance increased — fill succeeded (status API was slow)`);
+              }
+            } catch { /* non-fatal */ }
+
+            if (destVerified) {
+              roundResult.leg1.status = "completed_late";
+              hadTimeout = true;
+            } else {
+              progress(`Leg 1 TIMEOUT — destination balance unchanged, fill may still be pending`);
+              roundResult.leg1.status = "timeout";
+              roundFailed = true;
+              hadTimeout = true;
+            }
           }
         } catch (err) {
+          progress(`Leg 1 ERROR: ${sanitizeError(err as Error)}`);
           roundResult.leg1 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}` };
           roundFailed = true;
         }
 
         if (roundFailed) {
+          progress(`Round ${i + 1} failed at leg 1: ${roundResult.leg1?.status}`);
           results.push(roundResult);
           consecutiveFailures++;
+          // Extra cooldown after timeouts to let pending txs settle
+          if (hadTimeout) {
+            progress(`Post-timeout cooldown: waiting 30s for pending tx to settle...`);
+            await new Promise(r => setTimeout(r, POST_TIMEOUT_COOLDOWN_MS));
+          }
           continue;
         }
 
+        // Brief pause between legs
         await new Promise(r => setTimeout(r, 5_000));
+        // Extra cooldown if leg1 was a late completion
+        if (hadTimeout) {
+          progress(`Post-timeout cooldown: waiting 30s for balance propagation...`);
+          await new Promise(r => setTimeout(r, POST_TIMEOUT_COOLDOWN_MS));
+        }
 
         // ── Leg 2 ──────────────────────────────────────────────────────
         try {
+          // Capture pre-leg destination balance for post-timeout verification
+          let preDestBalance2 = 0n;
+          try {
+            preDestBalance2 = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+          } catch { /* non-fatal */ }
+
           const clamped2 = await getClampedAmount(
             leg2.chainId, leg2.token, walletAddress, leg2.decimals, userCapBtc
           );
           if (!clamped2) throw new Error(`Balance below minimum 0.00005 BTC on ${leg2.label.split("→")[0]}`);
+
+          progress(`Leg 2 (${leg2.label}): ${Number(clamped2.btc8Dec) / 1e8} BTC`);
 
           const quote2 = await persistence.getQuote({
             fromChainId: leg2.chainId, toChainId: leg2.destChainId,
@@ -406,47 +489,92 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             txHash: result2.txHash, orderId: result2.orderId, status: "submitted",
             amountBtc: `${Number(clamped2.btc8Dec) / 1e8}`,
           };
+          progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill...`);
 
+          // Poll for solver fill on destination chain
           let fulfilled = false;
-          for (let w = 0; w < 30; w++) {
-            await new Promise(r => setTimeout(r, 10_000));
+          let legFailed = false;
+          for (let w = 0; w < maxPolls; w++) {
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             const status = await persistence.getStatus(result2.trackingId, { orderId: result2.orderId });
             if (status.state === "completed") { fulfilled = true; break; }
-            if (status.state === "failed") break;
+            if (status.state === "failed") { legFailed = true; break; }
+            if ((w + 1) % 3 === 0) {
+              progress(`Leg 2 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
+            }
           }
-          roundResult.leg2.status = fulfilled ? "completed" : "timeout";
-          if (fulfilled) {
+
+          // Helper: track loss and count completion
+          const countRoundCompleted = async () => {
             completedRounds++;
             consecutiveFailures = 0;
-            // Track cumulative loss: compare home-chain balance vs start
             try {
               if (initialHomeBalance8Dec !== null && initialHomeBalance8Dec > 0n) {
-                const homeBal = BigInt(await getBalance(leg1.chainId, leg1.token, walletAddress));
+                const bal = await getBalance(leg1.chainId, leg1.token, walletAddress);
                 const current8Dec = leg1.decimals > 8
-                  ? homeBal / (10n ** BigInt(leg1.decimals - 8))
-                  : homeBal;
+                  ? BigInt(bal) / (10n ** BigInt(leg1.decimals - 8))
+                  : BigInt(bal);
                 if (current8Dec < initialHomeBalance8Dec) {
-                  const lossBps = Number(
+                  totalLossBps = Number(
                     ((initialHomeBalance8Dec - current8Dec) * 10000n) / initialHomeBalance8Dec
                   );
-                  totalLossBps = lossBps; // cumulative from start
+                  progress(`Cumulative loss: ${totalLossBps} bps`);
                 }
               }
             } catch { /* balance check failed — non-fatal, skip loss tracking */ }
-          } else {
+          };
+
+          if (fulfilled) {
+            progress(`Leg 2 COMPLETED`);
+            roundResult.leg2.status = "completed";
+            await countRoundCompleted();
+          } else if (legFailed) {
+            progress(`Leg 2 FAILED — order rejected by solver`);
+            roundResult.leg2.status = "failed: order rejected";
             consecutiveFailures++;
+          } else {
+            // Timeout — check destination balance directly
+            progress(`Leg 2 status API timed out — checking destination balance...`);
+            let destVerified = false;
+            try {
+              const postDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+              if (postDestBal > preDestBalance2) {
+                destVerified = true;
+                progress(`Leg 2: destination balance increased — fill succeeded (status API was slow)`);
+              }
+            } catch { /* non-fatal */ }
+
+            if (destVerified) {
+              roundResult.leg2.status = "completed_late";
+              await countRoundCompleted();
+              hadTimeout = true;
+            } else {
+              progress(`Leg 2 TIMEOUT — destination balance unchanged, fill may still be pending`);
+              roundResult.leg2.status = "timeout";
+              consecutiveFailures++;
+              hadTimeout = true;
+            }
           }
         } catch (err) {
+          progress(`Leg 2 ERROR: ${sanitizeError(err as Error)}`);
           roundResult.leg2 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}` };
           consecutiveFailures++;
         }
 
+        progress(`Round ${i + 1} result: leg1=${roundResult.leg1?.status ?? "n/a"}, leg2=${roundResult.leg2?.status ?? "n/a"}`);
         results.push(roundResult);
 
         if (i < params.rounds - 1 && consecutiveFailures < params.maxFailures) {
+          // Extra cooldown after timeouts
+          if (hadTimeout) {
+            progress(`Post-timeout cooldown: waiting 30s...`);
+            await new Promise(r => setTimeout(r, POST_TIMEOUT_COOLDOWN_MS));
+          }
           await new Promise(r => setTimeout(r, params.delay * 1000));
         }
       }
+
+      progress(`Finished. Completed: ${completedRounds}/${results.length} rounds, loss: ${totalLossBps} bps`);
 
       return {
         content: [{
@@ -454,7 +582,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           text: JSON.stringify({
             status: "completed",
             wallet: walletAddress,
-            direction: params.startFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base",
+            direction: directionLabel,
             amountMode: userCapBtc ? `capped at ${userCapBtc} BTC` : "max available (clamped to 0.00005–0.001 BTC)",
             completedRounds,
             totalAttempted: results.length,
