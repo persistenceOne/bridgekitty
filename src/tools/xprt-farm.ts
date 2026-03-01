@@ -12,7 +12,8 @@ import * as path from "path";
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
 const TIMEOUT_MS = 15_000;
-const POLL_INTERVAL_MS = 10_000;
+const POLL_INTERVAL_MS = 5_000;      // 5s between balance checks (primary fill detection)
+const STATUS_API_INTERVAL = 3;        // Check status API every Nth poll (secondary, often broken)
 const POST_TIMEOUT_COOLDOWN_MS = 30_000; // Extra cooldown after timeouts for RPC propagation
 
 /** Write timestamped progress to stderr (visible in MCP clients as notifications) */
@@ -70,12 +71,19 @@ interface ClampedAmount {
   btc8Dec: bigint;
 }
 
+// Reduced minimum for return legs (leg 2) — accounts for ~1% solver fee on the outbound leg.
+// When leg 1 sends 0.00005 BTC, the solver returns ~0.0000495-0.0000499, which is below
+// MIN_BTC_8DEC (5000) but above this threshold (4500 = 0.000045 BTC).
+const MIN_BTC_8DEC_LEG2 = 4500n;
+
 async function getClampedAmount(
   chainId: number,
   tokenAddress: string,
   walletAddress: string,
   decimals: number,
-  userCapBtc?: number
+  userCapBtc?: number,
+  /** If true, use reduced minimum and ignore cap — for return legs after solver fees */
+  isReturnLeg?: boolean
 ): Promise<ClampedAmount | null> {
   const balanceRaw = BigInt(await getBalance(chainId, tokenAddress, walletAddress));
   // Normalize to 8-decimal BTC (cbBTC is 8-dec, BTCB is 18-dec)
@@ -83,14 +91,16 @@ async function getClampedAmount(
     ? balanceRaw / (10n ** BigInt(decimals - 8))
     : balanceRaw;
 
-  if (balance8Dec < MIN_BTC_8DEC) return null; // Below minimum
+  const effectiveMin = isReturnLeg ? MIN_BTC_8DEC_LEG2 : MIN_BTC_8DEC;
+  if (balance8Dec < effectiveMin) return null; // Below minimum
 
   let clamped = balance8Dec > MAX_BTC_8DEC ? MAX_BTC_8DEC : balance8Dec;
-  if (userCapBtc !== undefined) {
+  // For return legs, don't apply user cap — send back whatever we received
+  if (!isReturnLeg && userCapBtc !== undefined) {
     const cap8Dec = BigInt(Math.round(userCapBtc * 1e8));
     if (cap8Dec < clamped) clamped = cap8Dec;
   }
-  if (clamped < MIN_BTC_8DEC) clamped = MIN_BTC_8DEC;
+  if (clamped < effectiveMin) clamped = effectiveMin;
 
   // Convert back to native decimals for the quote
   const amountRaw = decimals > 8
@@ -435,32 +445,30 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill — dual strategy: status API + destination balance check.
-          // The status API may be unreliable (500/404), so we always verify via balance.
+          // Poll for solver fill — balance check every 5s (primary), status API every 15s (backup).
+          // Balance checks are fast (~100ms via cached RPC) and reliable.
+          // The status API is often broken (500/404) but we check it as a secondary signal.
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
-            // Strategy 1: Check status API
-            const status = await persistence.getStatus(result1.trackingId, { orderId: result1.orderId });
-            if (status.state === "completed") { fulfilled = true; break; }
-            if (status.state === "failed") { legFailed = true; break; }
+            // Primary: check destination balance (fast, reliable)
+            try {
+              const currentDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+              if (currentDestBal > preDestBalance1) {
+                fulfilled = true;
+                progress(`Leg 1: fill confirmed via balance (+${((Number(currentDestBal - preDestBalance1) / 1e8) * (leg1.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
+                break;
+              }
+            } catch { /* non-fatal */ }
 
-            // Strategy 2: If status API is unreliable (unknown/404), check destination balance
-            if (status.state === "unknown" || status.state === "pending") {
-              try {
-                const currentDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
-                if (currentDestBal > preDestBalance1) {
-                  fulfilled = true;
-                  progress(`Leg 1: fill confirmed via destination balance increase`);
-                  break;
-                }
-              } catch { /* non-fatal — balance check is best-effort */ }
-            }
-
-            if ((w + 1) % 3 === 0) {
-              progress(`Leg 1 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
+            // Secondary: check status API every Nth poll
+            if ((w + 1) % STATUS_API_INTERVAL === 0) {
+              const status = await persistence.getStatus(result1.trackingId, { orderId: result1.orderId });
+              if (status.state === "completed") { fulfilled = true; progress(`Leg 1: fill confirmed via status API`); break; }
+              if (status.state === "failed") { legFailed = true; break; }
+              progress(`Leg 1 polling... ${(w + 1) * 5}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
           }
 
@@ -529,9 +537,9 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           } catch { /* non-fatal */ }
 
           const clamped2 = await getClampedAmount(
-            leg2.chainId, leg2.token, walletAddress, leg2.decimals, userCapBtc
+            leg2.chainId, leg2.token, walletAddress, leg2.decimals, userCapBtc, true /* isReturnLeg */
           );
-          if (!clamped2) throw new Error(`Balance below minimum 0.00005 BTC on ${leg2.label.split("→")[0]}`);
+          if (!clamped2) throw new Error(`Balance below minimum 0.000045 BTC on ${leg2.label.split("→")[0]} (solver fees may have reduced the amount too much)`);
 
           progress(`Leg 2 (${leg2.label}): ${Number(clamped2.btc8Dec) / 1e8} BTC`);
 
@@ -549,31 +557,28 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill — dual strategy: status API + destination balance check.
+          // Poll for solver fill — balance check every 5s (primary), status API every 15s (backup).
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
-            // Strategy 1: Check status API
-            const status = await persistence.getStatus(result2.trackingId, { orderId: result2.orderId });
-            if (status.state === "completed") { fulfilled = true; break; }
-            if (status.state === "failed") { legFailed = true; break; }
+            // Primary: check destination balance (fast, reliable)
+            try {
+              const currentDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+              if (currentDestBal > preDestBalance2) {
+                fulfilled = true;
+                progress(`Leg 2: fill confirmed via balance (+${((Number(currentDestBal - preDestBalance2) / 1e8) * (leg2.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
+                break;
+              }
+            } catch { /* non-fatal */ }
 
-            // Strategy 2: If status API is unreliable (unknown/404), check destination balance
-            if (status.state === "unknown" || status.state === "pending") {
-              try {
-                const currentDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
-                if (currentDestBal > preDestBalance2) {
-                  fulfilled = true;
-                  progress(`Leg 2: fill confirmed via destination balance increase`);
-                  break;
-                }
-              } catch { /* non-fatal — balance check is best-effort */ }
-            }
-
-            if ((w + 1) % 3 === 0) {
-              progress(`Leg 2 polling... ${(w + 1) * 10}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
+            // Secondary: check status API every Nth poll
+            if ((w + 1) % STATUS_API_INTERVAL === 0) {
+              const status = await persistence.getStatus(result2.trackingId, { orderId: result2.orderId });
+              if (status.state === "completed") { fulfilled = true; progress(`Leg 2: fill confirmed via status API`); break; }
+              if (status.state === "failed") { legFailed = true; break; }
+              progress(`Leg 2 polling... ${(w + 1) * 5}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
           }
 

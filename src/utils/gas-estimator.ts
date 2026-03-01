@@ -39,21 +39,21 @@ const CHAIN_RPC_ENV_KEYS: Record<number, string> = {
 };
 
 // Default public RPCs per chain with failover (used when env var not set)
-// Multiple endpoints per chain for reliability — tried in order on failure.
-// NOTE: Ankr free tier now requires API keys — removed. Using PublicNode + dRPC.
+// Ordered by measured latency (fastest first). Sourced from chainlist.org.
+// Base & BSC have extra endpoints since they're critical for XPRT farming.
 const DEFAULT_CHAIN_RPCS: Record<number, string[]> = {
-  1: ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
-  10: ["https://optimism-rpc.publicnode.com", "https://optimism.drpc.org"],
-  56: ["https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"],
-  137: ["https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
-  42161: ["https://arbitrum-one-rpc.publicnode.com", "https://arbitrum.drpc.org"],
-  43114: ["https://avalanche-c-chain-rpc.publicnode.com", "https://avax.drpc.org"],
-  8453: ["https://base-rpc.publicnode.com", "https://base.drpc.org"],
-  59144: ["https://linea-rpc.publicnode.com", "https://linea.drpc.org"],
-  534352: ["https://scroll-rpc.publicnode.com", "https://scroll.drpc.org"],
-  324: ["https://zksync-era-rpc.publicnode.com", "https://zksync.drpc.org"],
-  5000: ["https://mantle-rpc.publicnode.com", "https://mantle.drpc.org"],
-  81457: ["https://blast-rpc.publicnode.com", "https://blast.drpc.org"],
+  1: ["https://eth.drpc.org", "https://1rpc.io/eth", "https://ethereum-rpc.publicnode.com"],
+  10: ["https://optimism.drpc.org", "https://1rpc.io/op", "https://optimism-rpc.publicnode.com"],
+  56: ["https://1rpc.io/bnb", "https://bsc.drpc.org", "https://bsc-rpc.publicnode.com", "https://bsc.meowrpc.com", "https://bsc-dataseed1.defibit.io"],
+  137: ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"],
+  42161: ["https://arbitrum.drpc.org", "https://1rpc.io/arb", "https://arbitrum-one-rpc.publicnode.com"],
+  43114: ["https://avax.drpc.org", "https://1rpc.io/avax/c", "https://avalanche-c-chain-rpc.publicnode.com"],
+  8453: ["https://base.drpc.org", "https://1rpc.io/base", "https://gateway.tenderly.co/public/base", "https://base-rpc.publicnode.com", "https://base.meowrpc.com"],
+  59144: ["https://linea.drpc.org", "https://1rpc.io/linea", "https://linea-rpc.publicnode.com"],
+  534352: ["https://scroll.drpc.org", "https://1rpc.io/scroll", "https://scroll-rpc.publicnode.com"],
+  324: ["https://zksync.drpc.org", "https://1rpc.io/zksync2-era", "https://zksync-era-rpc.publicnode.com"],
+  5000: ["https://mantle.drpc.org", "https://1rpc.io/mantle", "https://mantle-rpc.publicnode.com"],
+  81457: ["https://blast.drpc.org", "https://blast-rpc.publicnode.com"],
 };
 
 /** M-3: Validate that an RPC URL uses HTTPS (except localhost) */

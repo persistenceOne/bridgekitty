@@ -116,8 +116,11 @@ const SUPPORTED_CHAINS = [
   { id: 56, name: "BNB Chain", key: "bsc" },
 ];
 
-// Amount caps in raw units (8-decimal BTC): 0.00005–0.001 BTC = 5000–100000
-const MIN_AMOUNT_RAW = 5000n;
+// Amount caps in raw units (8-decimal BTC): 0.000045–0.001 BTC = 4500–100000
+// MIN is set slightly below 0.00005 (5000) to allow return-leg fills after solver fees (~0.5%).
+// The xprt-farm tool uses 5000 as the minimum to START a round, but the backend accepts 4500
+// so that the return leg can proceed with the solver's output (which is slightly less than input).
+const MIN_AMOUNT_RAW = 4500n;
 const MAX_AMOUNT_RAW = 100000n;
 const MAX_QUOTES_RETURNED = 10;
 
@@ -156,7 +159,7 @@ export class PersistenceBackend implements BridgeBackend {
 
     if (normalized < MIN_AMOUNT_RAW) {
       throw new BackendValidationError(
-        `Amount too small (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Minimum is 0.00005 BTC.`
+        `Amount too small (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Minimum is 0.000045 BTC.`
       );
     }
     if (normalized > MAX_AMOUNT_RAW) {
@@ -475,7 +478,11 @@ export class PersistenceBackend implements BridgeBackend {
       const approveTx = await erc20.approve(PERMIT2_ADDRESS, prepared.inputAmount);
       console.log(`[persistence] Approval tx: ${approveTx.hash}`);
       await approveTx.wait();
-      console.log("[persistence] Permit2 approved.");
+      // Brief delay after approval to let RPC nodes sync the new allowance.
+      // Without this, estimateGas for initiate() can hit a node that hasn't seen the approval yet,
+      // causing a spurious TRANSFER_FROM_FAILED error.
+      console.log("[persistence] Permit2 approved. Waiting 2s for RPC propagation...");
+      await new Promise(r => setTimeout(r, 2_000));
     } else {
       console.log("[persistence] Permit2 already has sufficient allowance.");
     }
@@ -562,10 +569,18 @@ export class PersistenceBackend implements BridgeBackend {
           errMsg.includes("nonce has already been used")
         );
 
-        if (isTransferError) {
-          // Balance/allowance errors won't be fixed by a fresh nonce — fail immediately
+        if (isTransferError && attempt < MAX_NONCE_RETRIES) {
+          // Approval may not have propagated to all RPC nodes yet (race condition).
+          // Wait a few seconds for sync, then retry with a fresh nonce/order.
           console.warn(
-            `[persistence] initiate() failed with transfer/balance error (not retryable): ${errMsg.slice(0, 200)}`
+            `[persistence] initiate() got transfer error — waiting 3s for approval propagation (attempt ${attempt + 1}/${MAX_NONCE_RETRIES + 1})...`
+          );
+          await new Promise(r => setTimeout(r, 3_000));
+          continue;
+        } else if (isTransferError) {
+          // All retries exhausted — this is a genuine balance/allowance issue
+          console.warn(
+            `[persistence] initiate() failed with transfer/balance error after ${attempt + 1} attempts: ${errMsg.slice(0, 200)}`
           );
         } else if (isNonceError && attempt < MAX_NONCE_RETRIES) {
           console.warn(`[persistence] initiate() failed with nonce error (attempt ${attempt + 1}), will retry with fresh nonce`);
