@@ -82,6 +82,28 @@ export function getChainRpcUrl(chainId: number): string | undefined {
 const PROVIDER_TIMEOUT_MS = 8_000;
 const PROVIDER_CACHE_TTL_MS = 60_000; // Cache working providers for 60s
 
+/**
+ * Get a fresh (uncached) JsonRpcProvider for a specific RPC index.
+ * Used by the fill-detector polling loop to rotate across RPCs and avoid
+ * hitting the same stale eth_call cache on every poll.
+ *
+ * Unlike getProvider(), this:
+ * - Does NOT use the provider cache
+ * - Does NOT validate the provider (caller handles errors)
+ * - Creates a new provider instance each call
+ * - Caller MUST call provider.destroy() when done to prevent zombie retries
+ */
+export function getFreshProvider(chainId: number, index: number): ethers.JsonRpcProvider | null {
+  const urls = getChainRpcUrls(chainId);
+  if (urls.length === 0) return null;
+  return new ethers.JsonRpcProvider(urls[index % urls.length]);
+}
+
+/** Get the number of available RPC endpoints for a chain. */
+export function getRpcCount(chainId: number): number {
+  return getChainRpcUrls(chainId).length;
+}
+
 // Provider cache: avoids creating new JsonRpcProviders (and zombie retry loops) on every call
 const providerCache = new Map<number, { provider: ethers.JsonRpcProvider; fetchedAt: number }>();
 

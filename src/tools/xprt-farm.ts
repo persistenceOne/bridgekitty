@@ -7,6 +7,7 @@ import { getKey, getConfigDir } from "./wallet.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 import { simulateTransaction } from "../utils/tx-simulator.js";
 import { getProvider } from "../utils/gas-estimator.js";
+import { createFillWatcher, checkTransferEvents, checkBalanceChange, getCurrentBlockNumber } from "../utils/fill-detector.js";
 import * as path from "path";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
@@ -437,7 +438,22 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           });
           if (!quote1) throw new Error(`No quote available for ${leg1.label}`);
 
-          // signAndExecute waits for source tx confirmation — tokens leave wallet here
+          // Create push-based fill watcher BEFORE signing — gives the WS
+          // connections 5-15s to establish + subscribe while tx is being signed.
+          // Uses eth_subscribe("logs") which pushes events in real-time (3-15s),
+          // unlike eth_getLogs which is cached server-side for 30-120s.
+          const watcher1 = createFillWatcher(
+            leg1.destChainId, leg1.destToken, walletAddress,
+            () => progress(`Leg 1: fill PUSHED via eth_subscribe`),
+          );
+
+          // Capture destination chain block number for HTTP getLogs fallback.
+          let startBlock1: number;
+          try { startBlock1 = Math.max(0, await getCurrentBlockNumber(leg1.destChainId) - 2); }
+          catch { startBlock1 = 0; }
+
+          // signAndExecute waits for source tx confirmation — tokens leave wallet here.
+          // While this runs (5-15s), the WS subscription is establishing.
           const result1 = await persistence.signAndExecute(quote1, signer);
           roundResult.leg1 = {
             txHash: result1.txHash, orderId: result1.orderId, status: "submitted",
@@ -445,25 +461,52 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill — balance check every 5s (primary), status API every 15s (backup).
-          // Balance checks are fast (~100ms via cached RPC) and reliable.
-          // The status API is often broken (500/404) but we check it as a secondary signal.
+          // Multi-signal fill detection (4 prongs, fastest-first):
+          // 0. eth_subscribe push (primary — real-time, no caching), 3-15s
+          // 1. HTTP getLogs — rotated RPCs, 30-120s (server-side cached)
+          // 2. HTTP balance check — rotated RPCs, 30-120s (server-side cached)
+          // 3. Status API every Nth poll (often broken)
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
-            // Primary: check destination balance (fast, reliable)
+            // Prong 0: eth_subscribe push detection (primary — real-time)
+            if (watcher1.isDetected()) {
+              fulfilled = true;
+              progress(`Leg 1: fill confirmed via WS subscription [${(w + 1) * 5}s]`);
+              break;
+            }
+
+            // Prong 1: HTTP getLogs with RPC rotation (fallback)
             try {
-              const currentDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
-              if (currentDestBal > preDestBalance1) {
+              const eventResult = await checkTransferEvents(
+                leg1.destChainId, leg1.destToken, walletAddress, startBlock1, w
+              );
+              if (eventResult.found) {
                 fulfilled = true;
-                progress(`Leg 1: fill confirmed via balance (+${((Number(currentDestBal - preDestBalance1) / 1e8) * (leg1.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
+                progress(`Leg 1: fill confirmed via Transfer event [${(w + 1) * 5}s]`);
+                break;
+              }
+              if (eventResult.latestBlock && eventResult.latestBlock > startBlock1) {
+                startBlock1 = eventResult.latestBlock - 1;
+              }
+            } catch { /* non-fatal */ }
+
+            // Prong 2: Balance check with RPC rotation (fallback)
+            try {
+              const balResult = await checkBalanceChange(
+                leg1.destChainId, leg1.destToken, walletAddress, preDestBalance1, w
+              );
+              if (balResult.changed) {
+                fulfilled = true;
+                const delta = balResult.newBalance - preDestBalance1;
+                progress(`Leg 1: fill confirmed via balance (+${((Number(delta) / 1e8) * (leg1.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
                 break;
               }
             } catch { /* non-fatal */ }
 
-            // Secondary: check status API every Nth poll
+            // Prong 3: Status API every Nth poll (often broken)
             if ((w + 1) % STATUS_API_INTERVAL === 0) {
               const status = await persistence.getStatus(result1.trackingId, { orderId: result1.orderId });
               if (status.state === "completed") { fulfilled = true; progress(`Leg 1: fill confirmed via status API`); break; }
@@ -471,6 +514,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
               progress(`Leg 1 polling... ${(w + 1) * 5}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
           }
+          watcher1.cleanup();
 
           if (fulfilled) {
             progress(`Leg 1 COMPLETED`);
@@ -480,13 +524,15 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg1.status = "failed: order rejected";
             roundFailed = true;
           } else {
-            // Final fallback: one more balance check with 20s delay
+            // Final fallback: one more balance check with 20s delay using fresh provider
             progress(`Leg 1 polling exhausted — final balance check with 20s delay...`);
             let destVerified = false;
             await new Promise(r => setTimeout(r, 20_000));
             try {
-              const postDestBal = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
-              if (postDestBal > preDestBalance1) {
+              const fallback = await checkBalanceChange(
+                leg1.destChainId, leg1.destToken, walletAddress, preDestBalance1, maxPolls + 1
+              );
+              if (fallback.changed) {
                 destVerified = true;
                 progress(`Leg 1: destination balance increased after final retry`);
               }
@@ -550,6 +596,17 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           });
           if (!quote2) throw new Error(`No quote available for ${leg2.label}`);
 
+          // Create push-based fill watcher BEFORE signing (same strategy as leg 1)
+          const watcher2 = createFillWatcher(
+            leg2.destChainId, leg2.destToken, walletAddress,
+            () => progress(`Leg 2: fill PUSHED via eth_subscribe`),
+          );
+
+          // Capture destination chain block number for HTTP getLogs fallback
+          let startBlock2: number;
+          try { startBlock2 = Math.max(0, await getCurrentBlockNumber(leg2.destChainId) - 2); }
+          catch { startBlock2 = 0; }
+
           const result2 = await persistence.signAndExecute(quote2, signer);
           roundResult.leg2 = {
             txHash: result2.txHash, orderId: result2.orderId, status: "submitted",
@@ -557,23 +614,48 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           };
           progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill...`);
 
-          // Poll for solver fill — balance check every 5s (primary), status API every 15s (backup).
+          // Multi-signal fill detection (same 4-prong strategy as leg 1)
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
-            // Primary: check destination balance (fast, reliable)
+            // Prong 0: eth_subscribe push detection (primary — real-time)
+            if (watcher2.isDetected()) {
+              fulfilled = true;
+              progress(`Leg 2: fill confirmed via WS subscription [${(w + 1) * 5}s]`);
+              break;
+            }
+
+            // Prong 1: HTTP getLogs with RPC rotation (fallback)
             try {
-              const currentDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
-              if (currentDestBal > preDestBalance2) {
+              const eventResult = await checkTransferEvents(
+                leg2.destChainId, leg2.destToken, walletAddress, startBlock2, w
+              );
+              if (eventResult.found) {
                 fulfilled = true;
-                progress(`Leg 2: fill confirmed via balance (+${((Number(currentDestBal - preDestBalance2) / 1e8) * (leg2.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
+                progress(`Leg 2: fill confirmed via Transfer event [${(w + 1) * 5}s]`);
+                break;
+              }
+              if (eventResult.latestBlock && eventResult.latestBlock > startBlock2) {
+                startBlock2 = eventResult.latestBlock - 1;
+              }
+            } catch { /* non-fatal */ }
+
+            // Prong 2: Balance check with RPC rotation (fallback)
+            try {
+              const balResult = await checkBalanceChange(
+                leg2.destChainId, leg2.destToken, walletAddress, preDestBalance2, w
+              );
+              if (balResult.changed) {
+                fulfilled = true;
+                const delta = balResult.newBalance - preDestBalance2;
+                progress(`Leg 2: fill confirmed via balance (+${((Number(delta) / 1e8) * (leg2.destChainId === 56 ? 1e-10 : 1)).toFixed(8)} BTC) [${(w + 1) * 5}s]`);
                 break;
               }
             } catch { /* non-fatal */ }
 
-            // Secondary: check status API every Nth poll
+            // Prong 3: Status API every Nth poll (often broken)
             if ((w + 1) % STATUS_API_INTERVAL === 0) {
               const status = await persistence.getStatus(result2.trackingId, { orderId: result2.orderId });
               if (status.state === "completed") { fulfilled = true; progress(`Leg 2: fill confirmed via status API`); break; }
@@ -581,6 +663,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
               progress(`Leg 2 polling... ${(w + 1) * 5}s/${effectiveTimeout}s (status: ${status.humanReadable ?? status.state})`);
             }
           }
+          watcher2.cleanup();
 
           // Helper: track loss and count completion
           const countRoundCompleted = async () => {
@@ -611,13 +694,15 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             roundResult.leg2.status = "failed: order rejected";
             consecutiveFailures++;
           } else {
-            // Final fallback: one more balance check with 20s delay
+            // Final fallback: one more balance check with 20s delay using fresh provider
             progress(`Leg 2 polling exhausted — final balance check with 20s delay...`);
             let destVerified = false;
             await new Promise(r => setTimeout(r, 20_000));
             try {
-              const postDestBal = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
-              if (postDestBal > preDestBalance2) {
+              const fallback = await checkBalanceChange(
+                leg2.destChainId, leg2.destToken, walletAddress, preDestBalance2, maxPolls + 1
+              );
+              if (fallback.changed) {
                 destVerified = true;
                 progress(`Leg 2: destination balance increased after final retry`);
               }
