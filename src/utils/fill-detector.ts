@@ -187,12 +187,21 @@ export function createFillWatcher(
     }
   };
 
-  return {
+  const watcher: FillWatcher = {
     isDetected: () => detected,
     connectedCount: () => connected,
-    cleanup,
+    cleanup: () => {
+      cleanup();
+      _activeWatchers.delete(watcher);
+    },
   };
+  _activeWatchers.add(watcher);
+  return watcher;
 }
+
+// Track active watchers for process-exit cleanup
+const _activeWatchers = new Set<FillWatcher>();
+process.on("exit", () => { for (const w of _activeWatchers) { try { w.cleanup(); } catch {} } });
 
 /**
  * Check a single specific block for Transfer events to our wallet.

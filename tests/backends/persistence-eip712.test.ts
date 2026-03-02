@@ -135,7 +135,7 @@ describe("PersistenceBackend EIP-712 flow", () => {
     expect((prepared.eip712Value as any).witness.nonce).toBe(CONTRACT_NONCE);
   });
 
-  it("sets initiateDeadline to now + 180 seconds (3 min, H-2 tightened)", async () => {
+  it("sets initiateDeadline to now + 300 seconds (5 min, allows slow RPCs)", async () => {
     setupContractMock();
     const beforeCall = Math.floor(Date.now() / 1000);
 
@@ -150,8 +150,8 @@ describe("PersistenceBackend EIP-712 flow", () => {
     expect(callArgs[0]).toBe("prepareCrossChainOrder");
     const initiateDeadlineArg = Number(callArgs[1][6]); // 7th arg is initiateDeadline
     // Deadline should be between (beforeCall + 180) and (afterCall + 180), with small margin
-    expect(initiateDeadlineArg).toBeGreaterThanOrEqual(beforeCall + 180 - 2);
-    expect(initiateDeadlineArg).toBeLessThanOrEqual(afterCall + 180 + 2);
+    expect(initiateDeadlineArg).toBeGreaterThanOrEqual(beforeCall + 300 - 2);
+    expect(initiateDeadlineArg).toBeLessThanOrEqual(afterCall + 300 + 2);
   });
 
   it("approval amount matches the input amount exactly", async () => {

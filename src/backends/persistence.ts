@@ -316,8 +316,8 @@ export class PersistenceBackend implements BridgeBackend {
     const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, provider);
 
     const now = Math.floor(Date.now() / 1000);
-    const initiateDeadline = now + 180; // 3 minutes (H-2: tightened from 10 min)
-    const fillDeadline = now + 7200; // 2 hours
+    const initiateDeadline = now + 300; // 5 minutes (allows slow RPC confirmation)
+    const fillDeadline = now + 1800; // 30 minutes (tightened from 2h — fills take <30s)
 
     const inputAmount = data.sourceAmount;
     if (!inputAmount) throw new Error(`Missing sourceAmount in quote data`);
@@ -607,24 +607,24 @@ export class PersistenceBackend implements BridgeBackend {
     // Step 5: Submit to backend
     console.log("[persistence] Step 5: Submitting to backend...");
     const orderId = data.id ?? `order-${Date.now()}`;
-    try {
-      // Compute orderHash: keccak256 of the ABI-encoded order struct
-      const orderHash = ethers.keccak256(
-        ethers.AbiCoder.defaultAbiCoder().encode(
-          ["address", "address", "uint256", "uint32", "uint32", "uint32", "bytes"],
-          [
-            prepared.order.settlementContract,
-            prepared.order.swapper,
-            prepared.order.nonce,
-            prepared.order.originChainId,
-            prepared.order.initiateDeadline,
-            prepared.order.fillDeadline,
-            prepared.order.orderData,
-          ]
-        )
-      );
-      console.log(`[persistence] Order hash: ${orderHash}`);
+    // Compute orderHash: keccak256 of the ABI-encoded order struct (hoisted for retry access)
+    const orderHash = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["address", "address", "uint256", "uint32", "uint32", "uint32", "bytes"],
+        [
+          prepared.order.settlementContract,
+          prepared.order.swapper,
+          prepared.order.nonce,
+          prepared.order.originChainId,
+          prepared.order.initiateDeadline,
+          prepared.order.fillDeadline,
+          prepared.order.orderData,
+        ]
+      )
+    );
+    console.log(`[persistence] Order hash: ${orderHash}`);
 
+    try {
       await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -643,7 +643,29 @@ export class PersistenceBackend implements BridgeBackend {
       });
       console.log("[persistence] Order submitted to backend.");
     } catch (err) {
-      console.warn(`[persistence] Backend submission failed (non-fatal): ${(err as Error).message}`);
+      console.warn(`[persistence] Backend submission failed, retrying once: ${(err as Error).message}`);
+      try {
+        await new Promise(r => setTimeout(r, 2000));
+        await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            settlementContract: prepared.order.settlementContract,
+            swapper: swapperAddress,
+            nonce: Number(prepared.order.nonce),
+            originChainId: sourceChainId,
+            initiateDeadline: Number(prepared.order.initiateDeadline),
+            fillDeadline: Number(prepared.order.fillDeadline),
+            orderData: prepared.order.orderData,
+            signature,
+            orderHash,
+            sourceChainTxHash: initiateTx.hash,
+          }),
+        });
+        console.log("[persistence] Order submitted to backend (retry succeeded).");
+      } catch (retryErr) {
+        console.warn(`[persistence] Backend submission retry also failed (non-fatal): ${(retryErr as Error).message}`);
+      }
     }
 
     return {
