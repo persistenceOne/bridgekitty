@@ -608,18 +608,36 @@ export class PersistenceBackend implements BridgeBackend {
     console.log("[persistence] Step 5: Submitting to backend...");
     const orderId = data.id ?? `order-${Date.now()}`;
     try {
+      // Compute orderHash: keccak256 of the ABI-encoded order struct
+      const orderHash = ethers.keccak256(
+        ethers.AbiCoder.defaultAbiCoder().encode(
+          ["address", "address", "uint256", "uint32", "uint32", "uint32", "bytes"],
+          [
+            prepared.order.settlementContract,
+            prepared.order.swapper,
+            prepared.order.nonce,
+            prepared.order.originChainId,
+            prepared.order.initiateDeadline,
+            prepared.order.fillDeadline,
+            prepared.order.orderData,
+          ]
+        )
+      );
+      console.log(`[persistence] Order hash: ${orderHash}`);
+
       await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           settlementContract: prepared.order.settlementContract,
           swapper: swapperAddress,
-          nonce: prepared.order.nonce.toString(),
+          nonce: Number(prepared.order.nonce),
           originChainId: sourceChainId,
           initiateDeadline: Number(prepared.order.initiateDeadline),
           fillDeadline: Number(prepared.order.fillDeadline),
           orderData: prepared.order.orderData,
           signature,
+          orderHash,
           sourceChainTxHash: initiateTx.hash,
         }),
       });

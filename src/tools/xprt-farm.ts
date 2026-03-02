@@ -13,7 +13,9 @@ import * as path from "path";
 const REWARDS_API = "https://rewards.interop.persistence.one";
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
 const TIMEOUT_MS = 15_000;
-const POLL_INTERVAL_MS = 5_000;      // 5s between balance checks (primary fill detection)
+const POLL_INTERVAL_MS = 5_000;      // 5s between polls (standard)
+const FAST_POLL_INTERVAL_MS = 2_000; // 2s for first 30s (aggressive phase)
+const FAST_POLL_DURATION_MS = 30_000; // How long to use fast polling
 const STATUS_API_INTERVAL = 3;        // Check status API every Nth poll (secondary, often broken)
 const POST_TIMEOUT_COOLDOWN_MS = 30_000; // Extra cooldown after timeouts for RPC propagation
 
@@ -459,7 +461,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             txHash: result1.txHash, orderId: result1.orderId, status: "submitted",
             amountBtc: `${Number(clamped1.btc8Dec) / 1e8}`,
           };
-          progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill...`);
+          progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill (${watcher1.connectedCount()} WS connections)...`);
 
           // Multi-signal fill detection (4 prongs, fastest-first):
           // 0. eth_subscribe push (primary — real-time, no caching), 3-15s
@@ -469,7 +471,8 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            const pollMs = (w * POLL_INTERVAL_MS < FAST_POLL_DURATION_MS) ? FAST_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+            await new Promise(r => setTimeout(r, pollMs));
 
             // Prong 0: eth_subscribe push detection (primary — real-time)
             if (watcher1.isDetected()) {
@@ -612,13 +615,14 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             txHash: result2.txHash, orderId: result2.orderId, status: "submitted",
             amountBtc: `${Number(clamped2.btc8Dec) / 1e8}`,
           };
-          progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill...`);
+          progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill (${watcher2.connectedCount()} WS connections)...`);
 
           // Multi-signal fill detection (same 4-prong strategy as leg 1)
           let fulfilled = false;
           let legFailed = false;
           for (let w = 0; w < maxPolls; w++) {
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            const pollMs = (w * POLL_INTERVAL_MS < FAST_POLL_DURATION_MS) ? FAST_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+            await new Promise(r => setTimeout(r, pollMs));
 
             // Prong 0: eth_subscribe push detection (primary — real-time)
             if (watcher2.isDetected()) {

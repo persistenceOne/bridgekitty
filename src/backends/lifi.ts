@@ -13,7 +13,7 @@ import { buildApproveData } from "../utils/evm.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 
 const BASE_URL = "https://li.quest/v1";
-const TIMEOUT_MS = 15_000;
+const TIMEOUT_MS = 30_000;
 
 async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const controller = new AbortController();
@@ -69,7 +69,7 @@ export class LiFiBackend implements BridgeBackend {
         toAddress: params.toAddress || params.fromAddress,
         options: {
           order: params.preference === "fastest" ? "FASTEST" : "CHEAPEST",
-          slippage: 0.005,
+          slippage: 0.03,
           maxPriceImpact: 0.4,
           allowSwitchChain: false,
         },
