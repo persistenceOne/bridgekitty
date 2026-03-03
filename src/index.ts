@@ -81,10 +81,10 @@ getKey("solanaKey");
 // Revenue from bridge fees funds ongoing development.
 // Persistence Interop routes are always fee-free (direct protocol integration).
 const BRIDGEKITTY_FEE_WALLET = "0xb24aCFcda187135490d81517ab56709FdDe6a81A";
-const BRIDGEKITTY_DEBRIDGE_FEE = "0.1"; // 0.1% affiliate fee
+const BRIDGEKITTY_DEBRIDGE_FEE = undefined as string | undefined; // disabled for now
 const BRIDGEKITTY_LIFI_FEE = undefined as string | undefined; // needs portal.li.fi registration first
 const BRIDGEKITTY_LIFI_INTEGRATOR = undefined as string | undefined; // needs portal.li.fi registration first
-const BRIDGEKITTY_RELAY_FEE = "10"; // 10 bps = 0.1% app fee
+const BRIDGEKITTY_RELAY_FEE = undefined as string | undefined; // disabled for now
 
 function createEngine(): RoutingEngine {
   const lifi = new LiFiBackend(
