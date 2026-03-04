@@ -181,9 +181,31 @@ describe("PersistenceBackend EIP-712 flow", () => {
     expect(outputAmountArg).toBe("9850500000000000");
   });
 
-  it("buildTransaction throws explaining signAndExecute is required", async () => {
+  it("buildTransaction throws when fromAddress is missing from quoteData", async () => {
+    // Quote without fromAddress in quoteData — should throw a clear error
     await expect(backend.buildTransaction(makeQuote())).rejects.toThrow(
-      /signAndExecute/
+      /fromAddress not available/
     );
+  });
+
+  it("buildTransaction returns EIP-712 data when fromAddress is in quoteData", async () => {
+    setupContractMock();
+    const quote = makeQuote({
+      quoteData: {
+        id: "test-order-1",
+        sourceChainId: 8453,
+        destinationChainId: 56,
+        sourceAmount: "10000",
+        estimatedDestinationAmount: "9900000000000000",
+        fromAddress: SWAPPER,
+      },
+    });
+    const tx = await backend.buildTransaction(quote);
+    // Should return EIP-712 data, not a regular transaction
+    expect(tx.eip712).toBeDefined();
+    expect(tx.eip712!.domain).toMatchObject({ name: "Permit2", chainId: 8453 });
+    expect(tx.approvalTx).toBeDefined();
+    expect(tx.approvalTx!.chainId).toBe(8453);
+    expect(tx.provider).toBe("persistence");
   });
 });

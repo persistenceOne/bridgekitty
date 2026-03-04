@@ -1,10 +1,15 @@
 import { z } from "zod";
+import { ethers } from "ethers";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
-import { resolveChainId, getChainName } from "../utils/chains.js";
+import { resolveChainId, getChainName, isCosmosChain } from "../utils/chains.js";
 import { resolveToken } from "../utils/token-registry.js";
 import { parseTokenAmount } from "../utils/tokens.js";
 import { BackendValidationError } from "../backends/types.js";
+import { getProvider } from "../utils/gas-estimator.js";
+
+const ERC20_BALANCE_ABI = ["function balanceOf(address) view returns (uint256)"];
+const NATIVE_TOKEN_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
 // ─── Rate Limiting ─────────────────────────────────────────────────────
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
@@ -52,10 +57,13 @@ function checkRateLimit(routeKey: string): boolean {
 export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
   server.tool(
     "bridge_get_quote",
-    "Get the best cross-chain bridge quote across multiple protocols (LI.FI, Persistence). " +
-    "Accepts token symbols (e.g. 'USDC', 'ETH', 'WBTC') or contract addresses (0x...). " +
+    "Get the best cross-chain bridge quote across multiple providers (LI.FI, Squid Router, deBridge, Across, Relay, Persistence Interop). " +
+    "Supports EVM chains, Cosmos chains (Persistence, Cosmos Hub), and Solana. " +
+    "Accepts token symbols (e.g. 'USDC', 'ETH', 'WBTC', 'XPRT', 'ATOM') or contract addresses (0x...). " +
     "Symbols are resolved to verified canonical addresses only — no unverified tokens. " +
-    "Returns ranked options by output amount, speed, and fees.",
+    "Returns ranked options by output amount, speed, and fees. Includes failedProviders array showing which providers didn't return quotes and why. " +
+    "Preconditions: None for quoting. Use bridge_execute to act on a quote. " +
+    "Error codes: 'Token resolution failed' (unknown symbol), 'Rate limited' (too many requests), 'Validation error' (invalid params).",
     {
       fromChain: z
         .string()
@@ -87,6 +95,10 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         .enum(["cheapest", "fastest"])
         .default("fastest")
         .describe("Optimize for lowest cost or fastest delivery"),
+      providers: z
+        .array(z.string())
+        .optional()
+        .describe("Optional: only query specific providers (e.g. ['squid', 'lifi']). Default: query all."),
     },
     async (params) => {
       // Resolve chains
@@ -154,6 +166,24 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         };
       }
 
+      // Pre-flight: warn if fromAddress is a zero address or burn address
+      const ZERO_ADDRESSES = [
+        "0x0000000000000000000000000000000000000000",
+        "0x000000000000000000000000000000000000dead",
+      ];
+      if (ZERO_ADDRESSES.includes(params.fromAddress.toLowerCase())) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Invalid sender address",
+              message: `The sender address ${params.fromAddress} appears to be a zero/burn address. Provide a real wallet address.`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
       // Resolve tokens via verified registry
       const fromTokenResult = resolveToken(params.fromToken, fromChainId);
       if (!fromTokenResult.ok) {
@@ -212,6 +242,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           preference: params.preference,
           fromTokenDecimals: decimals,
           toTokenDecimals: toDecimals,
+          providers: params.providers,
         });
       } catch (err) {
         if (err instanceof BackendValidationError) {
@@ -302,6 +333,9 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
       }
 
       function formatQuote(q: typeof quotes[number]) {
+        const expiresInSeconds = q.expiresAt
+          ? Math.max(0, Math.round((q.expiresAt - Date.now()) / 1000))
+          : null;
         return {
           provider: q.provider,
           youReceiveMin: `${q.minOutputAmount} ${toSymbol}`,
@@ -310,16 +344,55 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           route: q.route,
           tags: buildTags(q),
           quoteId: q.quoteId,
+          expiresAt: q.expiresAt ? new Date(q.expiresAt).toISOString() : null,
+          expiresInSeconds,
         };
       }
 
       const bestGasDisplay = formatGasFee(best);
-      const response = {
+
+      // Include failed providers for transparency
+      const failedProviders = engine.getLastFailedProviders();
+
+      const response: Record<string, any> = {
         bestQuote: formatQuote(best),
         alternatives: quotes.slice(1, 5).map(formatQuote),
         totalRoutesFound: quotes.length,
         summary: `Best: receive min ${best.minOutputAmount} ${toSymbol} via ${best.provider} (gas: ${bestGasDisplay}, ETA: ${formatTime(best.estimatedTimeSeconds)}). ${quotes.length > 1 ? `${quotes.length - 1} alternative(s) available.` : ""}`,
       };
+
+      if (failedProviders.length > 0) {
+        response.failedProviders = failedProviders;
+      }
+
+      // Pre-flight balance warning: check if wallet has enough funds for the quote
+      if (params.fromAddress && !isCosmosChain(fromChainId)) {
+        try {
+          const isNative =
+            fromTokenAddress.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase() ||
+            fromTokenAddress === "0x0000000000000000000000000000000000000000";
+
+          const provider = await getProvider(fromChainId);
+          let walletBalance: bigint;
+          let balanceFormatted: string;
+
+          if (isNative) {
+            walletBalance = await provider.getBalance(params.fromAddress);
+            balanceFormatted = ethers.formatEther(walletBalance);
+          } else {
+            const contract = new ethers.Contract(fromTokenAddress, ERC20_BALANCE_ABI, provider);
+            walletBalance = await contract.balanceOf(params.fromAddress);
+            balanceFormatted = ethers.formatUnits(walletBalance, decimals);
+          }
+
+          const amountRequired = BigInt(amountRaw);
+          if (walletBalance < amountRequired) {
+            response.balanceWarning = `Warning: wallet balance (${balanceFormatted} ${fromSymbol}) may be insufficient for ${params.amount} ${fromSymbol} quote`;
+          }
+        } catch {
+          // Balance check failure should never block the quote
+        }
+      }
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],

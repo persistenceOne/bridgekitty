@@ -1,7 +1,8 @@
 import { ethers } from "ethers";
 import { BackendValidationError } from "./types.js";
 import { formatTokenAmount } from "../utils/tokens.js";
-import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { estimateGasCostUsd, getGasUnits, getProvider } from "../utils/gas-estimator.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 /**
  * @deprecated Use BackendValidationError from types.ts instead.
  * Kept as re-export for backward compatibility.
@@ -21,11 +22,6 @@ const ERC20_ABI = [
     "function approve(address spender, uint256 amount) returns (bool)",
     "function allowance(address owner, address spender) view returns (uint256)",
 ];
-// RPC endpoints
-const RPC_URLS = {
-    8453: "https://mainnet.base.org",
-    56: "https://bsc-dataseed1.binance.org",
-};
 // EIP-712 types for Permit2 witness signing
 const PERMIT2_DOMAIN = {
     name: "Permit2",
@@ -79,8 +75,11 @@ const SUPPORTED_CHAINS = [
     { id: 8453, name: "Base", key: "base" },
     { id: 56, name: "BNB Chain", key: "bsc" },
 ];
-// Amount caps in raw units (8-decimal BTC): 0.00005–0.001 BTC = 5000–100000
-const MIN_AMOUNT_RAW = 5000n;
+// Amount caps in raw units (8-decimal BTC): 0.000045–0.001 BTC = 4500–100000
+// MIN is set slightly below 0.00005 (5000) to allow return-leg fills after solver fees (~0.5%).
+// The xprt-farm tool uses 5000 as the minimum to START a round, but the backend accepts 4500
+// so that the return leg can proceed with the solver's output (which is slightly less than input).
+const MIN_AMOUNT_RAW = 4500n;
 const MAX_AMOUNT_RAW = 100000n;
 const MAX_QUOTES_RETURNED = 10;
 // Supported BTC token addresses
@@ -112,7 +111,7 @@ export class PersistenceBackend {
         const fromDecimals = fromToken?.symbol === "BTCB" ? 18 : 8;
         const normalized = fromDecimals > 8 ? amt / (10n ** BigInt(fromDecimals - 8)) : amt;
         if (normalized < MIN_AMOUNT_RAW) {
-            throw new BackendValidationError(`Amount too small (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Minimum is 0.00005 BTC.`);
+            throw new BackendValidationError(`Amount too small (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Minimum is 0.000045 BTC.`);
         }
         if (normalized > MAX_AMOUNT_RAW) {
             throw new BackendValidationError(`Amount too large (${amountRaw} raw, ~${Number(normalized) / 1e8} BTC). Maximum is 0.001 BTC.`);
@@ -218,6 +217,7 @@ export class PersistenceBackend {
                     sourceChainId: params.fromChainId,
                     destinationChainId: params.toChainId,
                     sourceAmount: params.amountRaw,
+                    fromAddress: params.fromAddress,
                 },
                 expiresAt: best.expirationTime ? new Date(best.expirationTime).getTime() : Date.now() + 60_000,
                 _meta: {
@@ -248,14 +248,11 @@ export class PersistenceBackend {
         if (!fromBtc || !toBtc) {
             throw new Error(`Unsupported chain pair: ${sourceChainId} → ${destChainId}`);
         }
-        const rpcUrl = RPC_URLS[sourceChainId];
-        if (!rpcUrl)
-            throw new Error(`No RPC for chain ${sourceChainId}`);
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const provider = await getProvider(sourceChainId);
         const settlement = new ethers.Contract(SETTLEMENT_CONTRACT, SETTLEMENT_ABI, provider);
         const now = Math.floor(Date.now() / 1000);
-        const initiateDeadline = now + 180; // 3 minutes (H-2: tightened from 10 min)
-        const fillDeadline = now + 7200; // 2 hours
+        const initiateDeadline = now + 300; // 5 minutes (allows slow RPC confirmation)
+        const fillDeadline = now + 1800; // 30 minutes (tightened from 2h — fills take <30s)
         const inputAmount = data.sourceAmount;
         if (!inputAmount)
             throw new Error(`Missing sourceAmount in quote data`);
@@ -363,16 +360,51 @@ export class PersistenceBackend {
         };
     }
     /**
-     * Build transaction data. When no signer is available (MCP flow), returns
-     * prepared order data that the caller must sign externally.
-     * Use signAndExecute() for flows where a signer is available.
+     * Build transaction data for the MCP flow (no server-side signing).
+     * Calls prepareOrder() via on-chain view to get the EIP-712 typed data
+     * and Permit2 approval tx that the agent/wallet must sign externally.
+     *
+     * Use signAndExecute() for flows where a signer (private key) is available.
      */
-    async buildTransaction(_quote) {
-        // MEDIUM-003: Persistence requires EIP-712 signing via signAndExecute() with a signer.
-        // The MCP flow cannot support this backend for execution (only for quoting).
-        throw new Error("Persistence Interop requires EIP-712 signature-based execution via signAndExecute(). " +
-            "The MCP buildTransaction() flow cannot support this backend. " +
-            "Use the Persistence Interop frontend or an agent with signing capability.");
+    async buildTransaction(quote) {
+        const data = quote.quoteData;
+        const fromAddress = data.fromAddress;
+        if (!fromAddress) {
+            throw new Error("fromAddress not available in Persistence quote. Re-quote with a fromAddress set.");
+        }
+        const prepared = await this.prepareOrder(quote, fromAddress);
+        const sourceChainId = data.sourceChainId ?? 8453;
+        const orderId = data.id ?? `pending-${Date.now()}`;
+        // Serialize bigint values in EIP-712 typed data to strings for JSON
+        const serializeBigInts = (obj) => {
+            if (typeof obj === "bigint")
+                return obj.toString();
+            if (Array.isArray(obj))
+                return obj.map(serializeBigInts);
+            if (obj !== null && typeof obj === "object") {
+                return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, serializeBigInts(v)]));
+            }
+            return obj;
+        };
+        return {
+            // The on-chain initiate() call targets the settlement contract,
+            // but execution requires the EIP-712 signature first — return placeholders.
+            to: SETTLEMENT_CONTRACT,
+            data: "0x",
+            value: "0x0",
+            chainId: sourceChainId,
+            provider: "persistence",
+            trackingId: `persistence:${orderId}`,
+            approvalTx: prepared.approvalTx,
+            eip712: {
+                domain: serializeBigInts(prepared.eip712Domain),
+                types: prepared.eip712Types,
+                value: serializeBigInts(prepared.eip712Value),
+                description: "Permit2 CrossChainOrder — sign this EIP-712 message with your wallet to authorize the " +
+                    "Persistence Interop bridge. After signing, call the settlement contract's initiate() " +
+                    "with the order struct and your signature.",
+            },
+        };
     }
     /**
      * Full sign-and-execute flow for when a signer (private key) is available.
@@ -383,11 +415,8 @@ export class PersistenceBackend {
     async signAndExecute(quote, signer) {
         const data = quote.quoteData;
         const sourceChainId = data.sourceChainId ?? data.chainId ?? 8453;
-        const rpcUrl = RPC_URLS[sourceChainId];
-        if (!rpcUrl)
-            throw new Error(`No RPC for chain ${sourceChainId}`);
         // Ensure signer is connected to the right chain
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const provider = await getProvider(sourceChainId);
         const connectedSigner = signer.connect(provider);
         const swapperAddress = await connectedSigner.getAddress();
         // Step 1: Prepare the order
@@ -402,7 +431,11 @@ export class PersistenceBackend {
             const approveTx = await erc20.approve(PERMIT2_ADDRESS, prepared.inputAmount);
             console.log(`[persistence] Approval tx: ${approveTx.hash}`);
             await approveTx.wait();
-            console.log("[persistence] Permit2 approved.");
+            // Brief delay after approval to let RPC nodes sync the new allowance.
+            // Without this, estimateGas for initiate() can hit a node that hasn't seen the approval yet,
+            // causing a spurious TRANSFER_FROM_FAILED error.
+            console.log("[persistence] Permit2 approved. Waiting 2s for RPC propagation...");
+            await new Promise(r => setTimeout(r, 2_000));
         }
         else {
             console.log("[persistence] Permit2 already has sufficient allowance.");
@@ -461,12 +494,28 @@ export class PersistenceBackend {
             catch (initiateError) {
                 lastInitiateError = initiateError;
                 const errMsg = initiateError.message ?? "";
-                const isNonceError = errMsg.includes("NONCE_ALREADY_USED") ||
+                // Distinguish nonce errors (retryable) from transfer/balance errors (not retryable)
+                const isTransferError = errMsg.includes("TRANSFER_FROM_FAILED") ||
+                    errMsg.includes("TRANSFER_FAILED") ||
+                    errMsg.includes("insufficient balance") ||
+                    errMsg.includes("ERC20: transfer amount exceeds balance");
+                const isNonceError = !isTransferError && (errMsg.includes("NONCE_ALREADY_USED") ||
                     errMsg.includes("InvalidNonce") ||
-                    errMsg.includes("nonce") ||
-                    errMsg.includes("TRANSFER_FAILED");
-                if (isNonceError && attempt < MAX_NONCE_RETRIES) {
-                    console.warn(`[persistence] initiate() failed with nonce/transfer error (attempt ${attempt + 1}), will retry with fresh nonce`);
+                    errMsg.includes("nonce too low") ||
+                    errMsg.includes("nonce has already been used"));
+                if (isTransferError && attempt < MAX_NONCE_RETRIES) {
+                    // Approval may not have propagated to all RPC nodes yet (race condition).
+                    // Wait a few seconds for sync, then retry with a fresh nonce/order.
+                    console.warn(`[persistence] initiate() got transfer error — waiting 3s for approval propagation (attempt ${attempt + 1}/${MAX_NONCE_RETRIES + 1})...`);
+                    await new Promise(r => setTimeout(r, 3_000));
+                    continue;
+                }
+                else if (isTransferError) {
+                    // All retries exhausted — this is a genuine balance/allowance issue
+                    console.warn(`[persistence] initiate() failed with transfer/balance error after ${attempt + 1} attempts: ${errMsg.slice(0, 200)}`);
+                }
+                else if (isNonceError && attempt < MAX_NONCE_RETRIES) {
+                    console.warn(`[persistence] initiate() failed with nonce error (attempt ${attempt + 1}), will retry with fresh nonce`);
                     continue;
                 }
                 // Final failure — revoke approval and throw
@@ -487,6 +536,17 @@ export class PersistenceBackend {
         // Step 5: Submit to backend
         console.log("[persistence] Step 5: Submitting to backend...");
         const orderId = data.id ?? `order-${Date.now()}`;
+        // Compute orderHash: keccak256 of the ABI-encoded order struct (hoisted for retry access)
+        const orderHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["address", "address", "uint256", "uint32", "uint32", "uint32", "bytes"], [
+            prepared.order.settlementContract,
+            prepared.order.swapper,
+            prepared.order.nonce,
+            prepared.order.originChainId,
+            prepared.order.initiateDeadline,
+            prepared.order.fillDeadline,
+            prepared.order.orderData,
+        ]));
+        console.log(`[persistence] Order hash: ${orderHash}`);
         try {
             await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
                 method: "POST",
@@ -494,19 +554,43 @@ export class PersistenceBackend {
                 body: JSON.stringify({
                     settlementContract: prepared.order.settlementContract,
                     swapper: swapperAddress,
-                    nonce: prepared.order.nonce.toString(),
+                    nonce: Number(prepared.order.nonce),
                     originChainId: sourceChainId,
                     initiateDeadline: Number(prepared.order.initiateDeadline),
                     fillDeadline: Number(prepared.order.fillDeadline),
                     orderData: prepared.order.orderData,
                     signature,
+                    orderHash,
                     sourceChainTxHash: initiateTx.hash,
                 }),
             });
             console.log("[persistence] Order submitted to backend.");
         }
         catch (err) {
-            console.warn(`[persistence] Backend submission failed (non-fatal): ${err.message}`);
+            console.warn(`[persistence] Backend submission failed, retrying once: ${err.message}`);
+            try {
+                await new Promise(r => setTimeout(r, 2000));
+                await fetchJson(`${BASE_URL}/orders/submit-with-tx`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        settlementContract: prepared.order.settlementContract,
+                        swapper: swapperAddress,
+                        nonce: Number(prepared.order.nonce),
+                        originChainId: sourceChainId,
+                        initiateDeadline: Number(prepared.order.initiateDeadline),
+                        fillDeadline: Number(prepared.order.fillDeadline),
+                        orderData: prepared.order.orderData,
+                        signature,
+                        orderHash,
+                        sourceChainTxHash: initiateTx.hash,
+                    }),
+                });
+                console.log("[persistence] Order submitted to backend (retry succeeded).");
+            }
+            catch (retryErr) {
+                console.warn(`[persistence] Backend submission retry also failed (non-fatal): ${retryErr.message}`);
+            }
         }
         return {
             txHash: initiateTx.hash,
@@ -543,7 +627,7 @@ export class PersistenceBackend {
         catch (err) {
             return {
                 state: "unknown",
-                humanReadable: `Status check failed: ${err.message}`,
+                humanReadable: `Status check failed: ${sanitizeError(err)}`,
                 provider: "persistence",
                 elapsed: 0,
             };

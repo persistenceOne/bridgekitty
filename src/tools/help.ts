@@ -1,0 +1,208 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const HELP_CONTENT: Record<string, string> = {
+  overview: [
+    "BridgeKitty is a cross-chain bridge aggregator MCP server connecting EVM chains, Solana, and Cosmos chains (including Persistence and Cosmoshub).",
+    "",
+    "It provides 6 bridge backends:",
+    "  - LI.FI: Aggregator covering 30+ bridges with the widest chain/token coverage.",
+    "  - Squid Router (Skip Protocol): 120+ chains including 62+ Cosmos/IBC chains.",
+    "  - deBridge DLN: Fast intent-based bridging with Solana support.",
+    "  - Across: Fastest fills (~6 seconds average).",
+    "  - Relay: Gas-optimized bridging for cost-sensitive transfers.",
+    "  - Persistence Interop: Direct BTCB<>cbBTC bridging with XPRT farming rewards.",
+    "",
+    "Available tool categories:",
+    "  Bridging: bridge_get_quote, bridge_execute, bridge_status, bridge_quote_multi",
+    "  Discovery: bridge_chains, bridge_tokens",
+    "  Wallet: wallet_status, wallet_setup, wallet_import, wallet_balance",
+    "  XPRT Farming: xprt_farm_prepare, xprt_farm_start, xprt_farm_status, xprt_farm_boost, xprt_rewards_check",
+    "  Onboarding: xprt_onboard",
+    "",
+    "Use bridgekitty_help with a specific topic for detailed guidance: 'bridging', 'farming', 'wallet', or 'troubleshooting'.",
+  ].join("\n"),
+
+  bridging: [
+    "Cross-Chain Bridging Guide",
+    "=========================",
+    "",
+    "Recommended flow:",
+    "  1. bridge_get_quote  - Compare quotes across all backends for your route.",
+    "  2. bridge_execute    - Get unsigned transaction data for the best quote.",
+    "  3. bridge_status     - Track your bridge transfer progress until completion.",
+    "",
+    "Parameters for bridge_get_quote:",
+    "  - fromChain / toChain: Chain name (e.g. 'base', 'arbitrum') or chain ID (e.g. '8453').",
+    "  - fromToken / toToken: Token symbol (e.g. 'USDC', 'ETH') or contract address (0x...).",
+    "  - amount: Human-readable amount (e.g. '100' for 100 USDC).",
+    "  - fromAddress: Your wallet address (0x...).",
+    "  - preference: 'cheapest' or 'fastest' (default: 'fastest').",
+    "",
+    "For multi-hop routes (e.g. ETH on Base to XPRT on Persistence):",
+    "  Use bridge_quote_multi which automatically finds optimal intermediate hops.",
+    "",
+    "Common pitfalls:",
+    "  - Quotes expire quickly (30-60s). Always get a fresh quote before executing.",
+    "  - Some routes require token approval before the bridge tx. bridge_execute will",
+    "    return both an approvalTransaction and the main transaction when needed.",
+    "  - Ensure you have enough native gas token on the source chain.",
+    "  - Token symbols are resolved against a verified registry. If a symbol is not found,",
+    "    use the raw contract address instead.",
+    "",
+    "Example: Bridge 100 USDC from Base to Arbitrum:",
+    "  1. bridge_get_quote(fromChain='base', toChain='arbitrum', fromToken='USDC',",
+    "     toToken='USDC', amount='100', fromAddress='0x...')",
+    "  2. bridge_execute(quoteId='<from step 1>')",
+    "  3. Sign and send the returned transaction(s)",
+    "  4. bridge_status(trackingId='<from step 2>')",
+  ].join("\n"),
+
+  farming: [
+    "XPRT Farming Guide",
+    "===================",
+    "",
+    "Earn XPRT rewards by bridging BTC variants (cbBTC <> BTCB) via Persistence Interop.",
+    "",
+    "Recommended flow:",
+    "  1. xprt_farm_prepare - Convert ETH or other tokens to cbBTC and bridge gas to BSC.",
+    "  2. xprt_farm_start   - Run automated BTC round-trip swaps to accumulate volume.",
+    "  3. xprt_farm_status  - Check wallet link status, balances, and current epoch info.",
+    "  4. xprt_rewards_check - View earned XPRT rewards, pending amounts, and multiplier tier.",
+    "",
+    "Optional multiplier boost:",
+    "  - xprt_farm_boost: Buy and stake XPRT to increase your reward multiplier.",
+    "  - Tiers: Explorer (1x, 0 XPRT), Voyager (2x, 10K XPRT), Pioneer (5x, 1M XPRT).",
+    "",
+    "Quick start with xprt_onboard:",
+    "  Run xprt_onboard for a personalized action plan based on your current wallet state.",
+    "",
+    "Key details:",
+    "  - Minimum per-leg amount: 0.00005 BTC (~$5 at current prices).",
+    "  - Maximum per-leg amount: 0.001 BTC (~$100 at current prices).",
+    "  - Rewards are distributed daily as airdrops (estimated, not guaranteed).",
+    "  - You need gas on both Base (ETH) and BSC (BNB) for round-trip farming.",
+    "  - Link your Persistence address to receive XPRT rewards.",
+    "",
+    "Common pitfalls:",
+    "  - Running out of gas on BSC (BNB) is the most common issue. xprt_farm_prepare",
+    "    automatically bridges some ETH to BNB for gas.",
+    "  - If rounds time out, the solver may be congested. Increase fillTimeout or try later.",
+    "  - Loss protection: xprt_farm_start has maxLossBps (default 200 = 2%) and maxFailures",
+    "    (default 3) to prevent excessive losses.",
+  ].join("\n"),
+
+  wallet: [
+    "Wallet Management Guide",
+    "=======================",
+    "",
+    "Recommended flow:",
+    "  1. wallet_status   - Check if a wallet is already configured.",
+    "  2. wallet_setup    - Generate new wallets for all chains (EVM + Cosmos + Solana).",
+    "     OR wallet_import - Import existing mnemonic or private key.",
+    "  3. wallet_balance  - Check balances across all configured chains.",
+    "",
+    "Key details:",
+    "  - Keys are stored in ~/.bridgekitty/.env (or BRIDGEKITTY_HOME env var).",
+    "  - A single mnemonic derives wallets for all chains:",
+    "    - EVM: BIP-44 path m/44'/60'/0'/0/0 (same address on all EVM chains).",
+    "    - Cosmos: persistence prefix for Persistence chain.",
+    "    - Solana: BIP-44 path m/44'/501'/0'/0'.",
+    "  - wallet_setup refuses to overwrite existing keys (safety feature).",
+    "  - wallet_import with overwrite=true will replace existing keys (back up first!).",
+    "",
+    "Security notes:",
+    "  - Keys are loaded into an in-memory store at startup and cleared from process.env.",
+    "  - The .env file should have 0600 permissions (owner read/write only).",
+    "  - Never share your mnemonic or private key.",
+    "  - Back up your .env file immediately after wallet creation.",
+    "",
+    "Common pitfalls:",
+    "  - Forgetting to back up keys before overwriting.",
+    "  - Running wallet_setup when keys already exist (it will refuse -- use wallet_import).",
+    "  - Importing only a privateKey gives EVM-only access. Use a mnemonic for full multi-chain support.",
+  ].join("\n"),
+
+  troubleshooting: [
+    "Troubleshooting Guide",
+    "=====================",
+    "",
+    "Rate Limits:",
+    "  - bridge_get_quote is limited to 10 requests per route per minute.",
+    "  - If you hit rate limits, wait 60 seconds before retrying the same route.",
+    "  - Different routes have independent rate limits.",
+    "",
+    "RPC Timeouts:",
+    "  - BridgeKitty uses multiple RPCs per chain with automatic failover.",
+    "  - If you see RPC timeout errors, the chain may be congested. Retry after a few minutes.",
+    "  - wallet_balance may show 'error' for individual chains while others succeed.",
+    "",
+    "Token Not Found:",
+    "  - Token symbols are resolved against a curated verified registry.",
+    "  - If a symbol is not found, use the raw contract address (0x...) instead.",
+    "  - Common aliases: 'ETH' works on all L2s, 'BNB' on BSC, 'MATIC'/'POL' on Polygon.",
+    "",
+    "No Routes Found:",
+    "  - Some token pairs or chain combinations may not be supported by any backend.",
+    "  - Try bridge_quote_multi for routes that need intermediate hops.",
+    "  - Check bridge_chains and bridge_tokens to verify chain/token support.",
+    "",
+    "Transaction Simulation Failed:",
+    "  - The bridge transaction would revert on-chain. Common causes:",
+    "    - Insufficient token balance or allowance.",
+    "    - Quote expired (get a fresh quote).",
+    "    - Insufficient gas (native token balance too low).",
+    "  - Always get a fresh quote and try again.",
+    "",
+    "XPRT Farming Issues:",
+    "  - 'Insufficient BTC balance': Run xprt_farm_prepare or send BTC to your wallet.",
+    "  - 'Balance below minimum': You need at least 0.00005 BTC per leg.",
+    "  - Timeouts during farming: Increase fillTimeout parameter (default 180s).",
+    "  - High loss: Adjust maxLossBps or reduce round count.",
+    "",
+    "Circuit Breaker:",
+    "  - Backends that fail repeatedly are temporarily disabled (circuit broken).",
+    "  - They automatically recover after a cooldown period.",
+    "  - If all backends are down, wait a few minutes and retry.",
+  ].join("\n"),
+};
+
+export function registerHelpTool(server: McpServer) {
+  server.tool(
+    "bridgekitty_help",
+    "Get help and guidance on using BridgeKitty. Topics: overview (default), bridging, farming, wallet, troubleshooting. " +
+    "Returns structured guides with recommended tool sequences and common pitfalls.",
+    {
+      topic: z
+        .enum(["overview", "bridging", "farming", "wallet", "troubleshooting"])
+        .optional()
+        .default("overview")
+        .describe("Help topic: 'overview', 'bridging', 'farming', 'wallet', or 'troubleshooting'"),
+    },
+    async (params) => {
+      const topic = params.topic ?? "overview";
+      const content = HELP_CONTENT[topic];
+
+      if (!content) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Unknown topic: ${topic}. Available topics: overview, bridging, farming, wallet, troubleshooting.`,
+          }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            topic,
+            guide: content,
+            availableTopics: ["overview", "bridging", "farming", "wallet", "troubleshooting"],
+          }, null, 2),
+        }],
+      };
+    }
+  );
+}

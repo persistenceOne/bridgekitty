@@ -2,6 +2,7 @@ import { formatTokenAmount } from "../utils/tokens.js";
 import { getBackendChainId, getAllChains } from "../utils/chains.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 const BASE_URL = "https://api.dln.trade/v1.0";
 const TIMEOUT_MS = 15_000;
 async function fetchJson(url, init) {
@@ -242,24 +243,41 @@ export class DeBridgeBackend {
         catch (err) {
             return {
                 state: "unknown",
-                humanReadable: `Status check failed: ${err.message}`,
+                humanReadable: `Status check failed: ${sanitizeError(err)}`,
                 provider: "debridge",
                 elapsed: 0,
             };
         }
     }
     async getSupportedChains() {
-        // deBridge supports major EVM chains — return our known chains
-        // with debridge as a provider
         try {
+            const allChains = getAllChains();
+            // Name-to-canonical lookup (for chains where originalChainId is missing/wrong)
+            const nameToCanonical = new Map(allChains.map((c) => [c.name.toLowerCase(), c]));
             const data = await fetchJson(`${BASE_URL}/supported-chains-info`);
-            if (data.chains) {
-                return Object.entries(data.chains).map(([id, info]) => ({
-                    id: Number(id),
-                    name: info.chainName ?? `Chain ${id}`,
-                    key: (info.chainName ?? `chain-${id}`).toLowerCase().replace(/\s+/g, "-"),
-                    providers: ["debridge"],
-                }));
+            if (Array.isArray(data.chains)) {
+                const seen = new Set();
+                const result = [];
+                for (const chain of data.chains) {
+                    // deBridge: originalChainId = EVM canonical ID, chainId = deBridge internal ID
+                    const rawId = chain.originalChainId ?? chain.chainId;
+                    const chainName = chain.chainName ?? "";
+                    // Match canonical entry by ID first, then by name (catches wrong/missing originalChainId)
+                    const canonical = allChains.find((c) => c.id === rawId) ??
+                        nameToCanonical.get(chainName.toLowerCase());
+                    const id = canonical?.id ?? rawId;
+                    // Deduplicate: skip if we already have this canonical chain
+                    if (seen.has(id))
+                        continue;
+                    seen.add(id);
+                    result.push({
+                        id,
+                        name: canonical?.name ?? chainName,
+                        key: canonical?.key ?? chainName.toLowerCase().replace(/\s+/g, "-"),
+                        providers: ["debridge"],
+                    });
+                }
+                return result;
             }
         }
         catch {

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { BackendValidationError } from "../backends/types.js";
 import { isValidEvmAddress } from "../utils/evm.js";
 import { CircuitBreaker } from "../utils/circuit-breaker.js";
-import { getAllChains } from "../utils/chains.js";
+import { getAllChains, isCosmosChain } from "../utils/chains.js";
 /** Minimum buffer (ms) before a quote's expiry — quotes expiring within this window are filtered out. */
 const EXPIRY_BUFFER_MS = 5_000;
 /** Timeout for each backend quote request (ms). */
@@ -36,20 +36,30 @@ function validateQuoteParams(params) {
     if (amountBig <= 0n) {
         throw new BackendValidationError(`Amount must be positive. Got: ${params.amountRaw}`);
     }
-    // fromAddress must be valid EVM address
-    if (!isValidEvmAddress(params.fromAddress)) {
+    // Determine if source/destination are Cosmos chains (relaxed address validation)
+    const fromIsCosmos = isCosmosChain(params.fromChainId);
+    const toIsCosmos = isCosmosChain(params.toChainId);
+    // fromAddress must be valid EVM address (unless destination is Cosmos-only route)
+    if (!fromIsCosmos && !isValidEvmAddress(params.fromAddress)) {
         throw new BackendValidationError(`Invalid sender address: "${params.fromAddress}". Expected 0x followed by 40 hex characters.`);
     }
-    // toAddress, if provided, must be valid
-    if (params.toAddress && !isValidEvmAddress(params.toAddress)) {
+    // toAddress, if provided, must be valid (relaxed for Cosmos bech32 addresses)
+    if (params.toAddress && !toIsCosmos && !isValidEvmAddress(params.toAddress)) {
         throw new BackendValidationError(`Invalid recipient address: "${params.toAddress}". Expected 0x followed by 40 hex characters.`);
     }
-    // Token addresses: must look like addresses (0x...) — we allow symbols at the tool layer,
-    // but by the time they reach the engine they should be resolved
-    if (!isValidEvmAddress(params.fromTokenAddress)) {
+    // Token addresses: must look like EVM addresses (0x...) or Cosmos denoms (e.g. "uxprt", "uatom")
+    // Cosmos denoms are lowercase alphanumeric strings (no 0x prefix)
+    const isValidTokenAddress = (addr, chainIsCosmos) => {
+        if (isValidEvmAddress(addr))
+            return true;
+        if (chainIsCosmos && /^[a-z][a-z0-9/]{1,128}$/.test(addr))
+            return true;
+        return false;
+    };
+    if (!isValidTokenAddress(params.fromTokenAddress, fromIsCosmos)) {
         throw new BackendValidationError(`Invalid source token address: "${params.fromTokenAddress}". Provide a valid 0x address or a recognized token symbol.`);
     }
-    if (!isValidEvmAddress(params.toTokenAddress)) {
+    if (!isValidTokenAddress(params.toTokenAddress, toIsCosmos)) {
         throw new BackendValidationError(`Invalid destination token address: "${params.toTokenAddress}". Provide a valid 0x address or a recognized token symbol.`);
     }
 }
@@ -84,6 +94,8 @@ export class RoutingEngine {
     circuitBreaker;
     /** Track per-request backend outcomes for error differentiation */
     lastRequestErrors = new Map();
+    /** Track per-request backend failure reasons */
+    lastFailedProviders = [];
     constructor(backends, circuitBreaker) {
         this.backends = backends;
         this.circuitBreaker = circuitBreaker ?? new CircuitBreaker();
@@ -113,11 +125,25 @@ export class RoutingEngine {
         }
         // Reset error tracking for this request
         this.lastRequestErrors.clear();
+        this.lastFailedProviders = [];
+        // Filter backends by providers filter (if specified)
+        let eligibleBackends = this.backends;
+        if (params.providers && params.providers.length > 0) {
+            const allowed = new Set(params.providers.map(p => p.toLowerCase()));
+            eligibleBackends = this.backends.filter((b) => allowed.has(b.name.toLowerCase()));
+            // Track filtered-out providers
+            for (const b of this.backends) {
+                if (!allowed.has(b.name.toLowerCase())) {
+                    this.lastFailedProviders.push({ provider: b.name, reason: "filtered out by providers parameter" });
+                }
+            }
+        }
         // Filter backends by circuit breaker state
-        const allowedBackends = this.backends.filter((b) => {
+        const allowedBackends = eligibleBackends.filter((b) => {
             const allowed = this.circuitBreaker.isAllowed(b.name);
             if (!allowed) {
                 this.lastRequestErrors.set(b.name, "error"); // circuit-broken = effectively errored
+                this.lastFailedProviders.push({ provider: b.name, reason: "circuit breaker open (too many recent failures)" });
             }
             return allowed;
         });
@@ -126,7 +152,7 @@ export class RoutingEngine {
             (b.getQuotes
                 ? b.getQuotes(params)
                 : b.getQuote(params).then((q) => (q ? [q] : []))).then((quotes) => ({ backendName: b.name, quotes })),
-            new Promise((resolve) => setTimeout(() => resolve({ backendName: b.name, quotes: [] }), BACKEND_TIMEOUT_MS)),
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`Backend ${b.name} timed out after ${BACKEND_TIMEOUT_MS}ms`)), BACKEND_TIMEOUT_MS)),
         ])));
         // Check for validation errors from backends and propagate the first one
         for (const r of results) {
@@ -143,6 +169,18 @@ export class RoutingEngine {
             if (r.status === "rejected") {
                 this.circuitBreaker.recordFailure(backendName);
                 this.lastRequestErrors.set(backendName, "error");
+                const errMsg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+                // Classify the error
+                let reason = "unknown error";
+                if (errMsg.includes("timed out"))
+                    reason = `timeout after ${BACKEND_TIMEOUT_MS / 1000}s`;
+                else if (errMsg.includes("rate limit") || errMsg.includes("429"))
+                    reason = "rate limited";
+                else if (errMsg.includes("ECONNREFUSED") || errMsg.includes("ENOTFOUND"))
+                    reason = "connection failed";
+                else
+                    reason = errMsg.slice(0, 100);
+                this.lastFailedProviders.push({ provider: backendName, reason });
                 continue;
             }
             const quotes = r.value.quotes.filter((q) => q !== null);
@@ -150,6 +188,7 @@ export class RoutingEngine {
                 // Empty result is not a failure for circuit breaker (route might not exist)
                 this.circuitBreaker.recordSuccess(backendName);
                 this.lastRequestErrors.set(backendName, "empty");
+                this.lastFailedProviders.push({ provider: backendName, reason: "no routes for this token pair" });
             }
             else {
                 this.circuitBreaker.recordSuccess(backendName);
@@ -235,6 +274,12 @@ export class RoutingEngine {
      */
     getCircuitBreaker() {
         return this.circuitBreaker;
+    }
+    /**
+     * Get the list of providers that failed or returned no results in the last request.
+     */
+    getLastFailedProviders() {
+        return this.lastFailedProviders;
     }
     /**
      * Differentiate why no quotes were returned.

@@ -16,7 +16,12 @@ function withTimeout(promise, ms, label) {
     ]);
 }
 export function registerExecuteBridge(server, engine) {
-    server.tool("bridge_execute", "Get the transaction data to execute a bridge transfer. Returns unsigned transaction(s) for the agent to sign and send. Use a quoteId from bridge_get_quote for best results.", {
+    server.tool("bridge_execute", "Get the unsigned transaction data to execute a cross-chain bridge transfer. " +
+        "Supports all providers: LI.FI, Squid Router, deBridge, Across, Relay, Persistence Interop. " +
+        "Returns unsigned transaction(s) for the agent/user to sign and send — no server-side signing. " +
+        "Preconditions: Call bridge_get_quote first and pass the quoteId. Ensure sufficient gas on source chain. " +
+        "If an approval is needed, send the approvalTransaction first, then the main transaction. " +
+        "After execution, use bridge_status with the returned trackingId to monitor progress.", {
         quoteId: z
             .string()
             .describe("Quote ID from bridge_get_quote result"),
@@ -74,6 +79,41 @@ export function registerExecuteBridge(server, engine) {
                 };
             }
             const txRequest = await withTimeout(backend.buildTransaction(quote), BUILD_TX_TIMEOUT_MS, `buildTransaction (${backend.name})`);
+            // EIP-712 flow (e.g. Persistence Interop): skip on-chain simulation,
+            // return the typed data for the agent to sign externally.
+            if (txRequest.eip712) {
+                const response = {
+                    provider: txRequest.provider,
+                    trackingId: txRequest.trackingId,
+                    slippage: params.slippage,
+                    signingRequest: {
+                        type: "eip712",
+                        domain: txRequest.eip712.domain,
+                        types: txRequest.eip712.types,
+                        value: txRequest.eip712.value,
+                        description: txRequest.eip712.description,
+                    },
+                    instructions: "Three steps required: " +
+                        "(1) Send the approvalTransaction to approve the token for Permit2 (exact amount, not unlimited). " +
+                        "(2) Sign the EIP-712 message in signingRequest with your wallet (eth_signTypedData_v4). " +
+                        "(3) Call the settlement contract's initiate() with the order struct and your signature. " +
+                        "Alternatively, use the xprt_farm_prepare / xprt_farm_start tools for automated server-side execution.",
+                };
+                if (txRequest.approvalTx) {
+                    response.approvalTransaction = {
+                        to: txRequest.approvalTx.to,
+                        data: txRequest.approvalTx.data,
+                        value: txRequest.approvalTx.value,
+                        chainId: txRequest.approvalTx.chainId,
+                    };
+                    response.approvalNote =
+                        "Approval is for the EXACT bridge amount only — not unlimited. " +
+                            "A new approval is needed for each bridge transaction.";
+                }
+                return {
+                    content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+                };
+            }
             // Simulate the main transaction to verify it won't revert
             const warnings = [];
             const simulation = await simulateTransaction(txRequest.chainId, {

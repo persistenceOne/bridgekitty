@@ -62,11 +62,13 @@ export declare class PersistenceBackend implements BridgeBackend {
      */
     prepareOrder(quote: BridgeQuote, swapperAddress: string): Promise<PreparedOrder>;
     /**
-     * Build transaction data. When no signer is available (MCP flow), returns
-     * prepared order data that the caller must sign externally.
-     * Use signAndExecute() for flows where a signer is available.
+     * Build transaction data for the MCP flow (no server-side signing).
+     * Calls prepareOrder() via on-chain view to get the EIP-712 typed data
+     * and Permit2 approval tx that the agent/wallet must sign externally.
+     *
+     * Use signAndExecute() for flows where a signer (private key) is available.
      */
-    buildTransaction(_quote: BridgeQuote): Promise<TransactionRequest>;
+    buildTransaction(quote: BridgeQuote): Promise<TransactionRequest>;
     /**
      * Full sign-and-execute flow for when a signer (private key) is available.
      * This is used by test scripts and the ACP listener.

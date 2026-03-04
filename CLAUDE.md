@@ -4,9 +4,9 @@
 
 BridgeKitty is a **cross-chain bridge aggregator MCP server** for AI agents. It gives Claude, GPT, Cursor, or any MCP-compatible AI the ability to find and execute cross-chain bridge transfers. Think "1inch for bridges, but the user is an AI agent."
 
-**One MCP server → 6 bridge backends → best routes across 100+ chains.**
+**One MCP server → 6 bridge backends → best routes across EVM, Cosmos, and Solana chains.**
 
-The hook: any-to-any bridging for agents. The sticky feature: XPRT farming rewards (earn XPRT by bridging BTC variants via Persistence Interop).
+The hook: any-to-any bridging for agents across all major ecosystems. The sticky feature: XPRT farming rewards (earn XPRT by bridging BTC variants via Persistence Interop).
 
 ## Architecture
 
@@ -17,7 +17,7 @@ src/
 ├── backends/                 # Bridge provider integrations
 │   ├── types.ts              # Shared interfaces (BridgeQuote, TransactionRequest, etc.)
 │   ├── lifi.ts               # LI.FI aggregator (30+ bridges, widest coverage)
-│   ├── skip.ts               # Skip Protocol (120+ chains incl. 62+ Cosmos/IBC)
+│   ├── squid.ts              # Squid Router (cross-ecosystem: EVM ↔ Cosmos ↔ Solana)
 │   ├── debridge.ts           # deBridge DLN (fast intents, Solana support)
 │   ├── across.ts             # Across (fastest fills ~6s)
 │   ├── relay.ts              # Relay (gas-optimized)
@@ -28,8 +28,12 @@ src/
 │   ├── check-status.ts       # bridge_status — track bridge progress
 │   ├── get-chains.ts         # bridge_chains — list supported chains
 │   ├── get-tokens.ts         # bridge_tokens — list tokens per chain
-│   ├── wallet.ts             # wallet_setup + wallet_balance
-│   └── xprt-farm.ts          # xprt_farm_* (prepare/start/status/boost)
+│   ├── multi-quote.ts        # bridge_quote_multi — multi-hop route resolution
+│   ├── help.ts               # bridgekitty_help — agent onboarding guide
+│   ├── xprt-rewards.ts       # xprt_rewards_check — reward accrual visibility
+│   ├── onboard.ts            # xprt_onboard — guided onboarding flow
+│   ├── wallet.ts             # wallet_setup + wallet_balance (with USD valuations)
+│   └── xprt-farm.ts          # xprt_farm_* (prepare/start/status/boost with dry-run)
 └── utils/                    # Shared utilities
     ├── token-registry.ts     # Curated verified token addresses (anti-phishing)
     ├── chains.ts             # Chain ID → name/RPC mapping
@@ -84,7 +88,7 @@ node -e 'import("./dist/backends/lifi.js").then(async ({LiFiBackend}) => { const
 | API | Base URL | Auth |
 |-----|----------|------|
 | LI.FI | `https://li.quest/v1/` | None (or `LIFI_API_KEY`) |
-| Skip | `https://api.skip.build/` | None (or `SKIP_API_KEY`) |
+| Squid Router | `https://v2.api.squidrouter.com/` | None (or `SQUID_INTEGRATOR_ID`) |
 | deBridge | `https://api.dln.trade/v1.0/` | None |
 | Across | `https://app.across.to/api/` | None |
 | Relay | `https://api.relay.link/` | None |

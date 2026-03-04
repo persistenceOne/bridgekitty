@@ -6,7 +6,10 @@ import { sanitizeError } from "../utils/sanitize-error.js";
 export function registerCheckStatus(server: McpServer, engine: RoutingEngine) {
   server.tool(
     "bridge_status",
-    "Check the status of a cross-chain bridge transfer. Provide the tracking ID from bridge_execute, or a transaction hash with provider name.",
+    "Check the status of a cross-chain bridge transfer. " +
+    "Supports all providers: LI.FI, Squid Router, deBridge, Across, Relay, Persistence Interop. " +
+    "Provide the tracking ID from bridge_execute, or a transaction hash with provider name. " +
+    "Returns: status (pending/in_progress/completed/failed), source/destination tx hashes, elapsed time, and estimated remaining time.",
     {
       trackingId: z
         .string()

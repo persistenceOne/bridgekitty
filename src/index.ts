@@ -7,7 +7,7 @@ import { PersistenceBackend } from "./backends/persistence.js";
 import { DeBridgeBackend } from "./backends/debridge.js";
 import { RelayBackend } from "./backends/relay.js";
 import { AcrossBackend } from "./backends/across.js";
-import { SkipBackend } from "./backends/skip.js";
+import { SquidBackend } from "./backends/squid.js";
 import { RoutingEngine } from "./routing/engine.js";
 import { CircuitBreaker } from "./utils/circuit-breaker.js";
 import { registerGetQuote } from "./tools/get-quote.js";
@@ -17,6 +17,10 @@ import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
 import { registerXprtFarmTools } from "./tools/xprt-farm.js";
 import { registerWalletTools, getKey, getConfigDir } from "./tools/wallet.js";
+import { registerHelpTool } from "./tools/help.js";
+import { registerXprtRewardsCheck } from "./tools/xprt-rewards.js";
+import { registerMultiQuote } from "./tools/multi-quote.js";
+import { registerOnboardTool } from "./tools/onboard.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -104,10 +108,10 @@ function createEngine(): RoutingEngine {
   const across = new AcrossBackend(
     BRIDGEKITTY_FEE_WALLET
   );
-  const skip = new SkipBackend(process.env.SKIP_API_KEY);
+  const squid = new SquidBackend(process.env.SQUID_INTEGRATOR_ID);
 
   const circuitBreaker = new CircuitBreaker();
-  return new RoutingEngine([lifi, persistence, debridge, relay, across, skip], circuitBreaker);
+  return new RoutingEngine([lifi, persistence, debridge, relay, across, squid], circuitBreaker);
 }
 
 // Read version from package.json to avoid duplication
@@ -153,6 +157,10 @@ async function main() {
   registerGetTokens(server, engine);
   registerWalletTools(server);
   registerXprtFarmTools(server, engine);
+  registerHelpTool(server);
+  registerXprtRewardsCheck(server);
+  registerMultiQuote(server, engine);
+  registerOnboardTool(server, engine);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

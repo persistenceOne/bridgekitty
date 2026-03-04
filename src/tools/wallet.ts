@@ -60,6 +60,108 @@ const EVM_CHAINS: Record<string, { chainId: number; symbol: string }> = {
 const PERSISTENCE_REST = "https://rest.core.persistence.one";
 const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 
+// Key ERC-20 tokens to check by default on each chain
+const DEFAULT_ERC20_TOKENS: Record<number, Array<{ symbol: string; address: string; decimals: number }>> = {
+  1: [ // Ethereum
+    { symbol: "USDC", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6 },
+    { symbol: "USDT", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6 },
+    { symbol: "WETH", address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", decimals: 18 },
+    { symbol: "WBTC", address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", decimals: 8 },
+    { symbol: "cbBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
+  ],
+  10: [ // Optimism
+    { symbol: "USDC", address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", decimals: 6 },
+    { symbol: "USDT", address: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58", decimals: 6 },
+    { symbol: "WETH", address: "0x4200000000000000000000000000000000000006", decimals: 18 },
+  ],
+  56: [ // BSC
+    { symbol: "BTCB", address: "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", decimals: 18 },
+    { symbol: "USDC", address: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", decimals: 18 },
+    { symbol: "USDT", address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18 },
+    { symbol: "WETH", address: "0x2170Ed0880ac9A755fd29B2688956BD959F933F8", decimals: 18 },
+  ],
+  137: [ // Polygon
+    { symbol: "USDC", address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6 },
+    { symbol: "USDT", address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6 },
+    { symbol: "WETH", address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18 },
+    { symbol: "WBTC", address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", decimals: 8 },
+  ],
+  42161: [ // Arbitrum
+    { symbol: "USDC", address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6 },
+    { symbol: "USDT", address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6 },
+    { symbol: "WETH", address: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", decimals: 18 },
+    { symbol: "WBTC", address: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", decimals: 8 },
+  ],
+  43114: [ // Avalanche
+    { symbol: "USDC", address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", decimals: 6 },
+    { symbol: "USDT", address: "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7", decimals: 6 },
+    { symbol: "WETH", address: "0x49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB", decimals: 18 },
+    { symbol: "WBTC", address: "0x50b7545627a5162F82A992c33b87aDc75187B218", decimals: 8 },
+  ],
+  8453: [ // Base
+    { symbol: "USDC", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6 },
+    { symbol: "cbBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
+    { symbol: "WETH", address: "0x4200000000000000000000000000000000000006", decimals: 18 },
+  ],
+};
+
+const ERC20_BALANCE_ABI = ["function balanceOf(address) view returns (uint256)"];
+
+// ─── USD Price Cache ─────────────────────────────────────────────────────
+const COINGECKO_API = "https://api.coingecko.com/api/v3";
+const PRICE_CACHE_TTL_MS = 60_000; // 60 seconds
+let priceCache: { prices: Record<string, number>; fetchedAt: number } | null = null;
+
+// CoinGecko IDs for native tokens
+const COINGECKO_IDS: Record<string, string> = {
+  ETH: "ethereum",
+  BNB: "binancecoin",
+  POL: "matic-network",
+  MATIC: "matic-network",
+  AVAX: "avalanche-2",
+  MNT: "mantle",
+  XPRT: "persistence",
+  SOL: "solana",
+  BTC: "bitcoin",
+  USDC: "usd-coin",
+  USDT: "tether",
+};
+
+async function fetchUsdPrices(): Promise<Record<string, number>> {
+  const now = Date.now();
+  if (priceCache && now - priceCache.fetchedAt < PRICE_CACHE_TTL_MS) {
+    return priceCache.prices;
+  }
+
+  try {
+    const ids = Object.values(COINGECKO_IDS).join(",");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const res = await fetch(
+        `${COINGECKO_API}/simple/price?ids=${ids}&vs_currencies=usd`,
+        { signal: controller.signal }
+      );
+      if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+      const data = await res.json();
+
+      const prices: Record<string, number> = {};
+      for (const [symbol, cgId] of Object.entries(COINGECKO_IDS)) {
+        if (data[cgId]?.usd) {
+          prices[symbol] = data[cgId].usd;
+        }
+      }
+      priceCache = { prices, fetchedAt: now };
+      return prices;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    // Return cached prices if available, even if stale
+    return priceCache?.prices ?? {};
+  }
+}
+
 async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -233,9 +335,20 @@ export function registerWalletTools(server: McpServer) {
   // ─── wallet_balance ───────────────────────────────────────────────────────
   server.tool(
     "wallet_balance",
-    "Check wallet balances across all chains (EVM, Cosmos, Solana). Uses multiple RPCs with automatic failover.",
+    "Check wallet balances across EVM, Cosmos, and Solana chains. " +
+    "Returns native token balances AND key ERC-20 token balances (USDC, USDT, WETH, WBTC, cbBTC, BTCB) by default. " +
+    "Uses multiple RPCs with automatic failover. " +
+    "Returns per-token balance, USD value (via CoinGecko), and total portfolio value. " +
+    "Call this before any bridging or farming operation to verify sufficient funds and gas.",
     {
       chains: z.array(z.string()).optional().describe("Chains to check (default: all). Options: ethereum, optimism, bsc, polygon, arbitrum, avalanche, base, linea, scroll, zksync, mantle, blast, persistence, solana"),
+      includeUsd: z.boolean().default(true).describe("Include USD valuations for each balance (default: true). Uses CoinGecko prices, cached for 60s."),
+      includeTokens: z.boolean().default(true).describe("Include ERC-20 token balances (USDC, USDT, WETH, WBTC, cbBTC, BTCB). Default: true."),
+      tokens: z.record(z.string(), z.array(z.object({
+        address: z.string().describe("Token contract address (0x...)"),
+        symbol: z.string().describe("Token symbol"),
+        decimals: z.number().describe("Token decimals"),
+      }))).optional().describe("Custom tokens to check per chain, e.g. { \"base\": [{ \"address\": \"0x...\", \"symbol\": \"FOO\", \"decimals\": 18 }] }"),
     },
     async (params) => {
       const privateKey = getKey("privateKey");
@@ -252,7 +365,17 @@ export function registerWalletTools(server: McpServer) {
 
       const evmAddress = new ethers.Wallet(privateKey).address;
       const chainsToCheck = params.chains ?? [...Object.keys(EVM_CHAINS), "persistence", "solana"];
-      const balances: Record<string, string> = {};
+
+      // Fetch USD prices in parallel with balance checks
+      const pricesPromise = params.includeUsd ? fetchUsdPrices() : Promise.resolve({} as Record<string, number>);
+
+      interface BalanceEntry {
+        balance: string;
+        symbol: string;
+        usdValue?: number | null;
+        error?: string;
+      }
+      const balances: Record<string, BalanceEntry> = {};
 
       // EVM chains — same address on all chains, fetch balances in parallel
       const evmChains = chainsToCheck
@@ -267,15 +390,82 @@ export function registerWalletTools(server: McpServer) {
         })
       );
 
+      const prices = await pricesPromise;
+
       for (const result of evmResults) {
         if (result.status === "fulfilled") {
           const { name, symbol, balance } = result.value;
-          balances[`${name} (${symbol})`] = balance;
+          const entry: BalanceEntry = { balance, symbol };
+          if (params.includeUsd) {
+            const price = prices[symbol];
+            entry.usdValue = price ? Math.round(parseFloat(balance) * price * 100) / 100 : null;
+          }
+          balances[`${name} (${symbol})`] = entry;
         } else {
-          // Find which chain failed by index
           const idx = evmResults.indexOf(result);
           const chain = evmChains[idx];
-          balances[`${chain.name} (${chain.symbol})`] = `error: ${sanitizeError(result.reason as Error)}`;
+          balances[`${chain.name} (${chain.symbol})`] = {
+            balance: "0",
+            symbol: chain.symbol,
+            usdValue: null,
+            error: `RPC unavailable: ${sanitizeError(result.reason as Error)}`,
+          };
+        }
+      }
+
+      // ERC-20 token balances
+      if (params.includeTokens !== false) {
+        const erc20Promises: Array<Promise<{ key: string; symbol: string; balance: string } | null>> = [];
+
+        for (const chain of evmChains) {
+          // Get default tokens for this chain
+          let tokensToCheck = DEFAULT_ERC20_TOKENS[chain.chainId] ?? [];
+
+          // Add custom tokens if specified
+          if (params.tokens?.[chain.name]) {
+            tokensToCheck = [...tokensToCheck, ...params.tokens[chain.name]];
+          }
+
+          for (const token of tokensToCheck) {
+            erc20Promises.push(
+              (async () => {
+                try {
+                  const provider = await getProvider(chain.chainId);
+                  const contract = new ethers.Contract(token.address, ERC20_BALANCE_ABI, provider);
+                  const bal: bigint = await contract.balanceOf(evmAddress);
+                  const balance = ethers.formatUnits(bal, token.decimals);
+                  return { key: `${chain.name} (${token.symbol})`, symbol: token.symbol, balance };
+                } catch {
+                  // Return zero balance so default tokens always appear in output
+                  return { key: `${chain.name} (${token.symbol})`, symbol: token.symbol, balance: "0" };
+                }
+              })()
+            );
+          }
+        }
+
+        const erc20Results = await Promise.allSettled(erc20Promises);
+        for (const result of erc20Results) {
+          if (result.status === "fulfilled" && result.value !== null) {
+            const { key, symbol, balance } = result.value;
+            const entry: BalanceEntry = { balance, symbol };
+            if (params.includeUsd) {
+              // Map ERC-20 symbols to price keys
+              const priceKey: Record<string, string> = {
+                USDC: "USDC", USDT: "USDT", WETH: "ETH", WBTC: "BTC",
+                cbBTC: "BTC", BTCB: "BTC", DAI: "USDC",
+              };
+              const pk = priceKey[symbol];
+              if (pk && prices[pk]) {
+                entry.usdValue = Math.round(parseFloat(balance) * prices[pk] * 100) / 100;
+              } else if (["USDC", "USDT", "DAI"].includes(symbol)) {
+                entry.usdValue = Math.round(parseFloat(balance) * 100) / 100; // ~$1 fallback
+              } else {
+                entry.usdValue = null;
+              }
+            }
+            balances[key] = entry;
+          }
         }
       }
 
@@ -288,9 +478,14 @@ export function registerWalletTools(server: McpServer) {
           const data = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${account.address}`);
           const xprt = data.balances?.find((b: any) => b.denom === "uxprt");
           const amount = xprt ? (parseInt(xprt.amount) / 1e6).toFixed(6) : "0";
-          balances["persistence (XPRT)"] = amount;
+          const entry: BalanceEntry = { balance: amount, symbol: "XPRT" };
+          if (params.includeUsd) {
+            const price = prices["XPRT"];
+            entry.usdValue = price ? Math.round(parseFloat(amount) * price * 100) / 100 : null;
+          }
+          balances["persistence (XPRT)"] = entry;
         } catch (err) {
-          balances["persistence (XPRT)"] = `error: ${sanitizeError(err as Error)}`;
+          balances["persistence (XPRT)"] = { balance: `error: ${sanitizeError(err as Error)}`, symbol: "XPRT", usdValue: null };
         }
       }
 
@@ -303,16 +498,40 @@ export function registerWalletTools(server: McpServer) {
           const keypair = Keypair.fromSecretKey(secretKey);
           const connection = new Connection(SOLANA_RPC);
           const lamports = await connection.getBalance(keypair.publicKey);
-          balances["solana (SOL)"] = (lamports / 1e9).toFixed(9);
+          const solBalance = (lamports / 1e9).toFixed(9);
+          const entry: BalanceEntry = { balance: solBalance, symbol: "SOL" };
+          if (params.includeUsd) {
+            const price = prices["SOL"];
+            entry.usdValue = price ? Math.round(parseFloat(solBalance) * price * 100) / 100 : null;
+          }
+          balances["solana (SOL)"] = entry;
         } catch (err) {
-          balances["solana (SOL)"] = `error: ${sanitizeError(err as Error)}`;
+          balances["solana (SOL)"] = { balance: `error: ${sanitizeError(err as Error)}`, symbol: "SOL", usdValue: null };
         }
+      }
+
+      // Calculate total portfolio USD value
+      let totalPortfolioUsd: number | null = null;
+      if (params.includeUsd) {
+        let total = 0;
+        let hasAnyPrice = false;
+        for (const entry of Object.values(balances)) {
+          if (entry.usdValue !== null && entry.usdValue !== undefined && entry.usdValue > 0) {
+            total += entry.usdValue;
+            hasAnyPrice = true;
+          }
+        }
+        totalPortfolioUsd = hasAnyPrice ? Math.round(total * 100) / 100 : null;
       }
 
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ wallet: evmAddress, balances }, null, 2),
+          text: JSON.stringify({
+            wallet: evmAddress,
+            balances,
+            ...(params.includeUsd ? { totalPortfolioUsd } : {}),
+          }, null, 2),
         }],
       };
     }

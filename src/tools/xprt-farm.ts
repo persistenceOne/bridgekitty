@@ -301,9 +301,17 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
   // ─── xprt_farm_start ────────────────────────────────────────────────────────
   server.tool(
     "xprt_farm_start",
-    "Start XPRT farming by running automated BTC round-trip swaps between BSC and Base via Persistence Interop. Earn XPRT rewards distributed daily as airdrops — not guaranteed income.",
+    "Start XPRT farming by running automated BTC round-trip swaps between BSC and Base via Persistence Interop. " +
+    "Earn XPRT rewards distributed daily as airdrops — not guaranteed income. " +
+    "Preconditions: Requires wallet_setup to have been run. Requires cbBTC on Base and/or BTCB on BSC (min 0.00005 BTC). Requires gas on both Base and BSC. " +
+    "Call wallet_balance before starting to verify sufficient balances. " +
+    "Response includes per-leg detail: amountSent, amountReceived, feeBps, provider, status, and durationSeconds.",
     {
-      amount: z.string().optional().describe("Max BTC amount per leg (e.g. '0.0003'). Omit to use full available balance each leg, clamped to protocol limits 0.00005–0.001 BTC."),
+      amount: z.string().optional().describe(
+        "Max BTC to send on the outbound leg of each round (e.g. '0.0003'). " +
+        "The return leg will bridge the full received balance back; actual return amount depends on bridge fees. " +
+        "Omit to use full available balance, clamped to protocol limits 0.00005–0.001 BTC."
+      ),
       startFrom: z.enum(["base", "bsc", "auto"]).default("auto").describe("'auto' (detect best direction), 'base' (cbBTC→BTCB), or 'bsc' (BTCB→cbBTC)"),
       rounds: z.number().default(10).describe("Number of round trips (default 10)"),
       delay: z.number().default(30).describe("Delay between rounds in seconds (default 30)"),
@@ -381,10 +389,22 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
         ? { chainId: 8453, destChainId: 56, token: CBTCB_BASE, destToken: BTCB_BSC, decimals: 8, label: "Base→BSC" }
         : { chainId: 56, destChainId: 8453, token: BTCB_BSC, destToken: CBTCB_BASE, decimals: 18, label: "BSC→Base" };
 
+      interface LegResult {
+        txHash: string;
+        orderId: string;
+        status: string;
+        amountSent: string;      // BTC sent on this leg
+        amountReceived?: string; // BTC received on destination (after fees)
+        feeBps?: number;         // Bridge fee in basis points
+        provider: string;        // Bridge provider (e.g. 'persistence')
+        txHashSource?: string;   // Source chain tx hash
+        txHashDest?: string;     // Destination chain tx hash (once confirmed)
+        durationSeconds?: number; // Time from submission to destination confirmation
+      }
       const results: Array<{
         round: number;
-        leg1?: { txHash: string; orderId: string; status: string; amountBtc?: string };
-        leg2?: { txHash: string; orderId: string; status: string; amountBtc?: string };
+        leg1?: LegResult;
+        leg2?: LegResult;
       }> = [];
 
       let consecutiveFailures = 0;
@@ -456,10 +476,13 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
           // signAndExecute waits for source tx confirmation — tokens leave wallet here.
           // While this runs (5-15s), the WS subscription is establishing.
+          const leg1Start = Date.now();
           const result1 = await persistence.signAndExecute(quote1, signer);
           roundResult.leg1 = {
             txHash: result1.txHash, orderId: result1.orderId, status: "submitted",
-            amountBtc: `${Number(clamped1.btc8Dec) / 1e8}`,
+            amountSent: `${Number(clamped1.btc8Dec) / 1e8}`,
+            provider: "persistence",
+            txHashSource: result1.txHash,
           };
           progress(`Leg 1 tx confirmed: ${result1.txHash.slice(0, 18)}... — polling for destination fill (${watcher1.connectedCount()} WS connections)...`);
 
@@ -522,6 +545,20 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           if (fulfilled) {
             progress(`Leg 1 COMPLETED`);
             roundResult.leg1.status = "completed";
+            roundResult.leg1.durationSeconds = Math.round((Date.now() - leg1Start) / 1000);
+            // Calculate amount received on destination
+            try {
+              const postDestBalance1 = BigInt(await getBalance(leg1.destChainId, leg1.destToken, walletAddress));
+              const received = postDestBalance1 - preDestBalance1;
+              const receivedDecimals = leg1.destChainId === 56 ? 18 : 8;
+              const received8Dec = receivedDecimals > 8 ? received / (10n ** BigInt(receivedDecimals - 8)) : received;
+              roundResult.leg1.amountReceived = `${Number(received8Dec) / 1e8}`;
+              // Calculate fee in basis points
+              if (clamped1.btc8Dec > 0n && received8Dec > 0n) {
+                const feeBps = Number(((clamped1.btc8Dec - received8Dec) * 10000n) / clamped1.btc8Dec);
+                roundResult.leg1.feeBps = feeBps;
+              }
+            } catch { /* non-fatal — balance check for amountReceived */ }
           } else if (legFailed) {
             progress(`Leg 1 FAILED — order rejected by solver`);
             roundResult.leg1.status = "failed: order rejected";
@@ -553,7 +590,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           }
         } catch (err) {
           progress(`Leg 1 ERROR: ${sanitizeError(err as Error)}`);
-          roundResult.leg1 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}` };
+          roundResult.leg1 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}`, amountSent: "0", provider: "persistence" };
           roundFailed = true;
         }
 
@@ -610,10 +647,13 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           try { startBlock2 = Math.max(0, await getCurrentBlockNumber(leg2.destChainId) - 2); }
           catch { startBlock2 = 0; }
 
+          const leg2Start = Date.now();
           const result2 = await persistence.signAndExecute(quote2, signer);
           roundResult.leg2 = {
             txHash: result2.txHash, orderId: result2.orderId, status: "submitted",
-            amountBtc: `${Number(clamped2.btc8Dec) / 1e8}`,
+            amountSent: `${Number(clamped2.btc8Dec) / 1e8}`,
+            provider: "persistence",
+            txHashSource: result2.txHash,
           };
           progress(`Leg 2 tx confirmed: ${result2.txHash.slice(0, 18)}... — polling for destination fill (${watcher2.connectedCount()} WS connections)...`);
 
@@ -692,6 +732,19 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           if (fulfilled) {
             progress(`Leg 2 COMPLETED`);
             roundResult.leg2.status = "completed";
+            roundResult.leg2.durationSeconds = Math.round((Date.now() - leg2Start) / 1000);
+            // Calculate amount received on destination
+            try {
+              const postDestBalance2 = BigInt(await getBalance(leg2.destChainId, leg2.destToken, walletAddress));
+              const received2 = postDestBalance2 - preDestBalance2;
+              const receivedDecimals2 = leg2.destChainId === 56 ? 18 : 8;
+              const received8Dec2 = receivedDecimals2 > 8 ? received2 / (10n ** BigInt(receivedDecimals2 - 8)) : received2;
+              roundResult.leg2.amountReceived = `${Number(received8Dec2) / 1e8}`;
+              if (clamped2.btc8Dec > 0n && received8Dec2 > 0n) {
+                const feeBps2 = Number(((clamped2.btc8Dec - received8Dec2) * 10000n) / clamped2.btc8Dec);
+                roundResult.leg2.feeBps = feeBps2;
+              }
+            } catch { /* non-fatal */ }
             await countRoundCompleted();
           } else if (legFailed) {
             progress(`Leg 2 FAILED — order rejected by solver`);
@@ -725,7 +778,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
           }
         } catch (err) {
           progress(`Leg 2 ERROR: ${sanitizeError(err as Error)}`);
-          roundResult.leg2 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}` };
+          roundResult.leg2 = { txHash: "", orderId: "", status: `failed: ${sanitizeError(err as Error)}`, amountSent: "0", provider: "persistence" };
           consecutiveFailures++;
         }
 
@@ -744,6 +797,39 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
 
       progress(`Finished. Completed: ${completedRounds}/${results.length} rounds, loss: ${totalLossBps} bps`);
 
+      // Calculate total volume for reward estimation
+      let totalVolumeBtc = 0;
+      for (const r of results) {
+        if (r.leg1?.amountSent) totalVolumeBtc += parseFloat(r.leg1.amountSent);
+        if (r.leg2?.amountSent) totalVolumeBtc += parseFloat(r.leg2.amountSent);
+      }
+
+      // Fetch current multiplier for reward summary
+      let currentMultiplier = "1x";
+      let nextMultiplierThreshold: string | undefined;
+      try {
+        const linkData = await fetchJson(`${REWARDS_API}/address-verification/check/${walletAddress}`);
+        if (linkData.isRegistered && linkData.persistenceAddress) {
+          const balData = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${linkData.persistenceAddress}`);
+          const xprt = balData.balances?.find((b: any) => b.denom === "uxprt");
+          const xprtStaked = xprt ? parseInt(xprt.amount) / 1e6 : 0;
+          const tier = getMultiplierTier(xprtStaked);
+          currentMultiplier = tier.multiplier;
+          if (tier.tier === "Explorer") nextMultiplierThreshold = "Stake 10,000 XPRT to reach 2x multiplier";
+          else if (tier.tier === "Voyager") nextMultiplierThreshold = "Stake 1,000,000 XPRT to reach 5x multiplier";
+        }
+      } catch { /* non-fatal */ }
+
+      const rewardSummary = {
+        totalVolumeBtc: totalVolumeBtc.toFixed(8),
+        estimatedXprtPerRound: "Varies by epoch participation — check xprt_rewards_check for current estimates",
+        currentMultiplier,
+        nextMultiplierThreshold,
+        suggestion: completedRounds > 0
+          ? "Run xprt_rewards_check to see your accumulated rewards. Consider staking XPRT for a higher multiplier."
+          : "No rounds completed. Check balances and gas, then try again.",
+      };
+
       return {
         content: [{
           type: "text" as const,
@@ -758,7 +844,8 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
             stoppedEarly: consecutiveFailures >= params.maxFailures ? "max consecutive failures" :
               totalLossBps >= params.maxLossBps ? "max loss threshold" : null,
             rounds: results,
-            disclaimer: "Rewards are estimated and not guaranteed.",
+            rewardSummary,
+            disclaimer: "Rewards are estimated and not guaranteed. Actual XPRT distribution depends on total epoch participation.",
           }, null, 2),
         }],
       };
@@ -828,11 +915,16 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
   // ─── xprt_farm_boost ────────────────────────────────────────────────────────
   server.tool(
     "xprt_farm_boost",
-    "Buy XPRT with any token and auto-stake for XPRT farming multiplier boost. One command to go from 1x to 2x or 5x multiplier.",
+    "Buy XPRT with any token and auto-stake for XPRT farming multiplier boost. " +
+    "One command to go from 1x to 2x or 5x multiplier. " +
+    "Set dryRun=true (default) to preview the estimated XPRT output, exchange rate, and fees before committing. " +
+    "Set dryRun=false to execute the swap. " +
+    "Preconditions: Requires wallet_setup with mnemonic (for Persistence address derivation).",
     {
       amount: z.string().describe("Amount of source token to swap (e.g. '0.1')"),
       token: z.string().default("ETH").describe("Source token symbol (default: ETH)"),
       chain: z.string().default("base").describe("Source chain (default: base)"),
+      dryRun: z.boolean().default(true).describe("When true (default), returns quote/preview without executing. Set to false to execute the swap."),
       validatorAddress: z.string().optional().describe("Validator address to delegate to (auto-picks best if omitted)"),
     },
     async (params) => {
@@ -858,7 +950,111 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
         };
       }
 
-      // TODO: Add automated EVM → Persistence XPRT swap via Skip Protocol IBC route
+      // Check current staking status for context
+      let currentXprtStaked = 0;
+      let currentTier = getMultiplierTier(0);
+      try {
+        const balData = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${persistenceAddress}`);
+        const xprt = balData.balances?.find((b: any) => b.denom === "uxprt");
+        currentXprtStaked = xprt ? parseInt(xprt.amount) / 1e6 : 0;
+        currentTier = getMultiplierTier(currentXprtStaked);
+      } catch { /* non-fatal */ }
+
+      if (params.dryRun) {
+        // Dry-run: estimate XPRT output based on CoinGecko prices
+        let estimatedXprtOutput: string | null = null;
+        let exchangeRate: string | null = null;
+        let priceImpact: string | null = null;
+        let inputValueUsd: number | null = null;
+
+        try {
+          // Fetch prices for source token and XPRT
+          const tokenPriceIds: Record<string, string> = {
+            ETH: "ethereum", BTC: "bitcoin", WBTC: "bitcoin", CBBTC: "bitcoin",
+            USDC: "usd-coin", USDT: "tether", BNB: "binancecoin", AVAX: "avalanche-2",
+            SOL: "solana", MATIC: "matic-network", POL: "matic-network",
+          };
+          const srcCgId = tokenPriceIds[params.token.toUpperCase()] ?? params.token.toLowerCase();
+          const url = `https://api.coingecko.com/api/v3/simple/price?ids=${srcCgId},persistence&vs_currencies=usd`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 10_000);
+          try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (res.ok) {
+              const data = await res.json();
+              const srcPriceUsd = data[srcCgId]?.usd;
+              const xprtPriceUsd = data["persistence"]?.usd;
+              if (srcPriceUsd && xprtPriceUsd && xprtPriceUsd > 0) {
+                inputValueUsd = parseFloat(params.amount) * srcPriceUsd;
+                // Estimate: subtract ~1% for bridge+swap fees
+                const netUsd = inputValueUsd * 0.99;
+                const xprtAmount = netUsd / xprtPriceUsd;
+                estimatedXprtOutput = xprtAmount.toFixed(2);
+                exchangeRate = `1 ${params.token} ≈ ${(srcPriceUsd / xprtPriceUsd).toFixed(2)} XPRT`;
+                priceImpact = "~1% (bridge + DEX swap fees)";
+              }
+            }
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch { /* price fetch failed — non-fatal */ }
+
+        const newStakedTotal = estimatedXprtOutput
+          ? currentXprtStaked + parseFloat(estimatedXprtOutput)
+          : currentXprtStaked;
+        const newTier = getMultiplierTier(newStakedTotal);
+
+        const quoteInfo: Record<string, any> = {
+          status: "dry_run",
+          message: "Preview of XPRT boost — no funds committed. Set dryRun=false to execute.",
+          input: {
+            amount: params.amount,
+            token: params.token,
+            chain: params.chain,
+            estimatedValueUsd: inputValueUsd ? `$${inputValueUsd.toFixed(2)}` : null,
+          },
+          estimatedOutput: {
+            estimatedXprtOutput: estimatedXprtOutput ? `~${estimatedXprtOutput} XPRT` : "Unable to estimate (price data unavailable)",
+            exchangeRate: exchangeRate ?? "Unable to estimate",
+            priceImpact: priceImpact ?? "Unable to estimate",
+          },
+          currentState: {
+            persistenceAddress,
+            currentXprtStaked: currentXprtStaked.toFixed(2),
+            currentTier: currentTier.tier,
+            currentMultiplier: currentTier.multiplier,
+          },
+          projectedState: {
+            projectedXprtStaked: newStakedTotal.toFixed(2),
+            projectedTier: newTier.tier,
+            projectedMultiplier: newTier.multiplier,
+            tierChange: newTier.multiplier !== currentTier.multiplier
+              ? `${currentTier.multiplier} → ${newTier.multiplier}`
+              : "no change",
+          },
+          estimatedRoute: `${params.token} on ${params.chain} → bridge to Persistence → swap to XPRT → auto-stake`,
+          feeBreakdown: {
+            bridgeFee: "~0.1-0.5% (varies by route)",
+            swapFee: "~0.3% (DEX swap)",
+            gasFee: "~$0.50-2.00 (varies by chain)",
+          },
+          tiers: {
+            Explorer: "0 XPRT staked → 1x multiplier",
+            Voyager: "10,000 XPRT staked → 2x multiplier",
+            Pioneer: "1,000,000 XPRT staked → 5x multiplier",
+          },
+          quoteExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        };
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(quoteInfo, null, 2),
+          }],
+        };
+      }
+
+      // Execute mode — currently requires manual XPRT acquisition
       return {
         content: [{
           type: "text" as const,
@@ -871,6 +1067,11 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
               `3. Run xprt_farm_boost again after funding — it will auto-stake your XPRT`,
             ],
             persistenceAddress,
+            currentState: {
+              currentXprtStaked: currentXprtStaked.toFixed(2),
+              currentTier: currentTier.tier,
+              currentMultiplier: currentTier.multiplier,
+            },
             tiers: {
               Explorer: "0 XPRT staked → 1x multiplier",
               Voyager: "10,000 XPRT staked → 2x multiplier",

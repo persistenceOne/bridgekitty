@@ -4,6 +4,7 @@ import { getAllChains } from "../utils/chains.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 import { lookupByAddress } from "../utils/token-registry.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 /** WETH addresses by chain — Across requires WETH address for native ETH bridging */
 const WETH_BY_CHAIN = {
     1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // Ethereum
@@ -238,7 +239,7 @@ export class AcrossBackend {
         catch (err) {
             return {
                 state: "unknown",
-                humanReadable: `Status check failed: ${err.message}`,
+                humanReadable: `Status check failed: ${sanitizeError(err)}`,
                 provider: "across",
                 elapsed: 0,
             };

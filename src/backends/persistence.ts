@@ -277,6 +277,7 @@ export class PersistenceBackend implements BridgeBackend {
           sourceChainId: params.fromChainId,
           destinationChainId: params.toChainId,
           sourceAmount: params.amountRaw,
+          fromAddress: params.fromAddress,
         },
         expiresAt: best.expirationTime ? new Date(best.expirationTime).getTime() : Date.now() + 60_000,
         _meta: {
@@ -434,18 +435,57 @@ export class PersistenceBackend implements BridgeBackend {
   }
 
   /**
-   * Build transaction data. When no signer is available (MCP flow), returns
-   * prepared order data that the caller must sign externally.
-   * Use signAndExecute() for flows where a signer is available.
+   * Build transaction data for the MCP flow (no server-side signing).
+   * Calls prepareOrder() via on-chain view to get the EIP-712 typed data
+   * and Permit2 approval tx that the agent/wallet must sign externally.
+   *
+   * Use signAndExecute() for flows where a signer (private key) is available.
    */
-  async buildTransaction(_quote: BridgeQuote): Promise<TransactionRequest> {
-    // MEDIUM-003: Persistence requires EIP-712 signing via signAndExecute() with a signer.
-    // The MCP flow cannot support this backend for execution (only for quoting).
-    throw new Error(
-      "Persistence Interop requires EIP-712 signature-based execution via signAndExecute(). " +
-      "The MCP buildTransaction() flow cannot support this backend. " +
-      "Use the Persistence Interop frontend or an agent with signing capability."
-    );
+  async buildTransaction(quote: BridgeQuote): Promise<TransactionRequest> {
+    const data = quote.quoteData as any;
+    const fromAddress = data.fromAddress;
+    if (!fromAddress) {
+      throw new Error(
+        "fromAddress not available in Persistence quote. Re-quote with a fromAddress set."
+      );
+    }
+
+    const prepared = await this.prepareOrder(quote, fromAddress);
+    const sourceChainId = data.sourceChainId ?? 8453;
+    const orderId = data.id ?? `pending-${Date.now()}`;
+
+    // Serialize bigint values in EIP-712 typed data to strings for JSON
+    const serializeBigInts = (obj: unknown): unknown => {
+      if (typeof obj === "bigint") return obj.toString();
+      if (Array.isArray(obj)) return obj.map(serializeBigInts);
+      if (obj !== null && typeof obj === "object") {
+        return Object.fromEntries(
+          Object.entries(obj as Record<string, unknown>).map(([k, v]) => [k, serializeBigInts(v)])
+        );
+      }
+      return obj;
+    };
+
+    return {
+      // The on-chain initiate() call targets the settlement contract,
+      // but execution requires the EIP-712 signature first — return placeholders.
+      to: SETTLEMENT_CONTRACT,
+      data: "0x",
+      value: "0x0",
+      chainId: sourceChainId,
+      provider: "persistence",
+      trackingId: `persistence:${orderId}`,
+      approvalTx: prepared.approvalTx,
+      eip712: {
+        domain: serializeBigInts(prepared.eip712Domain) as Record<string, unknown>,
+        types: prepared.eip712Types as unknown as Record<string, unknown>,
+        value: serializeBigInts(prepared.eip712Value) as Record<string, unknown>,
+        description:
+          "Permit2 CrossChainOrder — sign this EIP-712 message with your wallet to authorize the " +
+          "Persistence Interop bridge. After signing, call the settlement contract's initiate() " +
+          "with the order struct and your signature.",
+      },
+    };
   }
 
   /**

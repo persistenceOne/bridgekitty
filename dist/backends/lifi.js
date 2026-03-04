@@ -1,7 +1,8 @@
 import { formatTokenAmount } from "../utils/tokens.js";
 import { buildApproveData } from "../utils/evm.js";
+import { sanitizeError } from "../utils/sanitize-error.js";
 const BASE_URL = "https://li.quest/v1";
-const TIMEOUT_MS = 15_000;
+const TIMEOUT_MS = 30_000;
 async function fetchJson(url, init) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -53,7 +54,7 @@ export class LiFiBackend {
                 toAddress: params.toAddress || params.fromAddress,
                 options: {
                     order: params.preference === "fastest" ? "FASTEST" : "CHEAPEST",
-                    slippage: 0.005,
+                    slippage: 0.03,
                     maxPriceImpact: 0.4,
                     allowSwitchChain: false,
                 },
@@ -89,10 +90,16 @@ export class LiFiBackend {
             const routes = data.routes ?? [];
             if (routes.length === 0)
                 return [];
+            // Filter to single-step routes only — our buildTransaction() only handles step[0],
+            // so multi-step routes would silently drop subsequent steps. Let LI.FI handle
+            // complex multi-hop routes internally; we only expose atomic single-step bridges.
+            const singleStepRoutes = routes.filter((r) => (r.steps?.length ?? 0) === 1);
+            if (singleStepRoutes.length === 0)
+                return [];
             const integratorFeePercent = this.integratorFee
                 ? `${(parseFloat(this.integratorFee) * 100).toFixed(1)}%`
                 : null;
-            return routes.slice(0, 5).map((route) => {
+            return singleStepRoutes.slice(0, 5).map((route) => {
                 const steps = route.steps ?? [];
                 const firstStep = steps[0];
                 const lastStep = steps[steps.length - 1];
@@ -254,7 +261,7 @@ export class LiFiBackend {
         catch (err) {
             return {
                 state: "unknown",
-                humanReadable: `Status check failed: ${err.message}`,
+                humanReadable: `Status check failed: ${sanitizeError(err)}`,
                 provider: "lifi",
                 elapsed: 0,
             };

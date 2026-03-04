@@ -280,17 +280,41 @@ export class DeBridgeBackend implements BridgeBackend {
   }
 
   async getSupportedChains(): Promise<ChainInfo[]> {
-    // deBridge supports major EVM chains — return our known chains
-    // with debridge as a provider
     try {
+      const allChains = getAllChains();
+      // Name-to-canonical lookup (for chains where originalChainId is missing/wrong)
+      const nameToCanonical = new Map(
+        allChains.map((c) => [c.name.toLowerCase(), c])
+      );
+
       const data = await fetchJson(`${BASE_URL}/supported-chains-info`);
-      if (data.chains) {
-        return Object.entries(data.chains).map(([id, info]: [string, any]) => ({
-          id: Number(id),
-          name: info.chainName ?? `Chain ${id}`,
-          key: (info.chainName ?? `chain-${id}`).toLowerCase().replace(/\s+/g, "-"),
-          providers: ["debridge"],
-        }));
+      if (Array.isArray(data.chains)) {
+        const seen = new Set<number>();
+        const result: ChainInfo[] = [];
+
+        for (const chain of data.chains) {
+          // deBridge: originalChainId = EVM canonical ID, chainId = deBridge internal ID
+          const rawId: number = chain.originalChainId ?? chain.chainId;
+          const chainName: string = chain.chainName ?? "";
+
+          // Match canonical entry by ID first, then by name (catches wrong/missing originalChainId)
+          const canonical =
+            allChains.find((c) => c.id === rawId) ??
+            nameToCanonical.get(chainName.toLowerCase());
+
+          const id = canonical?.id ?? rawId;
+          // Deduplicate: skip if we already have this canonical chain
+          if (seen.has(id)) continue;
+          seen.add(id);
+
+          result.push({
+            id,
+            name: canonical?.name ?? chainName,
+            key: canonical?.key ?? chainName.toLowerCase().replace(/\s+/g, "-"),
+            providers: ["debridge"],
+          });
+        }
+        return result;
       }
     } catch {
       // Fallback to hardcoded chains if API fails

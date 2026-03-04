@@ -17,6 +17,8 @@ export interface QuoteParams {
     preference: "cheapest" | "fastest";
     fromTokenDecimals?: number;
     toTokenDecimals?: number;
+    /** Optional filter: only query these providers (by backend name, e.g. "lifi", "squid") */
+    providers?: string[];
 }
 export interface FeeBreakdown {
     gasCostUsd: number | null;
@@ -64,6 +66,17 @@ export interface TransactionRequest {
     trackingId: string;
     /** If true, caller must re-fetch bridge tx after approval confirms (avoids stale nonce). */
     needsPostApprovalBuild?: boolean;
+    /**
+     * EIP-712 typed data for backends that require off-chain signing (e.g. Persistence Interop).
+     * When present, skip tx simulation — the agent must sign this data with their wallet
+     * then submit the resulting signature to the backend.
+     */
+    eip712?: {
+        domain: Record<string, unknown>;
+        types: Record<string, unknown>;
+        value: Record<string, unknown>;
+        description: string;
+    };
 }
 export interface BridgeStatus {
     state: "pending" | "in_progress" | "completed" | "failed" | "refunded" | "unknown";

@@ -15,7 +15,7 @@
  * Agents can always pass raw 0x addresses to bypass the registry.
  */
 
-import { getChainName } from "./chains.js";
+import { getChainName, PERSISTENCE_CHAIN_ID, COSMOSHUB_CHAIN_ID } from "./chains.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -538,6 +538,27 @@ export const VERIFIED_TOKENS: VerifiedToken[] = [
       1: "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",       // Ethereum
       42161: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34",   // Arbitrum
       8453: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34",    // Base
+    },
+  },
+
+  // ── Cosmos Ecosystem Tokens ──────────────────────────────────────────
+
+  {
+    symbol: "XPRT",
+    name: "Persistence",
+    decimals: 6,
+    addresses: {
+      // Persistence chain uses uxprt denom (micro-XPRT, 6 decimals)
+      [PERSISTENCE_CHAIN_ID]: "uxprt",
+    },
+  },
+  {
+    symbol: "ATOM",
+    name: "Cosmos Hub",
+    decimals: 6,
+    addresses: {
+      // Cosmos Hub uses uatom denom
+      [COSMOSHUB_CHAIN_ID]: "uatom",
     },
   },
 ];
