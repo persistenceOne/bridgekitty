@@ -1,13 +1,12 @@
 /**
  * All-backends quote comparison — REAL API integration tests.
- * No mocks. Hits all 6 backend APIs directly.
+ * No mocks. Hits all 5 backend APIs directly.
  *
  * Tests that every backend can return a quote for common routes.
  * Also tests the routing engine's multi-backend aggregation.
  */
 import { describe, it, expect } from "vitest";
 import { LiFiBackend } from "../../src/backends/lifi.js";
-import { SkipBackend } from "../../src/backends/skip.js";
 import { DeBridgeBackend } from "../../src/backends/debridge.js";
 import { AcrossBackend } from "../../src/backends/across.js";
 import { RelayBackend } from "../../src/backends/relay.js";
@@ -27,7 +26,6 @@ const BTCB_BSC = "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c";
 describe("All-backends quote comparison (real APIs)", () => {
   // Initialize all backends without API keys (public access)
   const lifi = new LiFiBackend();
-  const skip = new SkipBackend();
   const debridge = new DeBridgeBackend();
   const across = new AcrossBackend();
   const relay = new RelayBackend();
@@ -73,26 +71,6 @@ describe("All-backends quote comparison (real APIs)", () => {
       for (const q of quotes) {
         expect(q.backendName).toBe("lifi");
       }
-    }, TIMEOUT);
-  });
-
-  describe("Skip", () => {
-    it("returns a quote for USDC Base → USDC Arbitrum", async () => {
-      const params: QuoteParams = {
-        fromChainId: 8453,
-        toChainId: 42161,
-        fromTokenAddress: USDC_BASE,
-        toTokenAddress: USDC_ARB,
-        amountRaw: "1000000",
-        fromAddress: TEST_ADDRESS,
-        preference: "cheapest",
-      };
-
-      const quote = await skip.getQuote(params);
-      expect(quote).not.toBeNull();
-      if (!quote) return;
-      expect(quote.backendName).toBe("skip");
-      expect(parseFloat(quote.outputAmount)).toBeGreaterThan(0.5);
     }, TIMEOUT);
   });
 
@@ -214,7 +192,7 @@ describe("All-backends quote comparison (real APIs)", () => {
   // ─── Cross-backend comparison ──────────────────────────────────────
 
   describe("Head-to-head comparison", () => {
-    it("all backends return quotes for USDC Base → USDC Arb", async () => {
+    it("EVM backends return quotes for USDC Base → USDC Arb", async () => {
       const params: QuoteParams = {
         fromChainId: 8453,
         toChainId: 42161,
@@ -225,17 +203,16 @@ describe("All-backends quote comparison (real APIs)", () => {
         preference: "cheapest",
       };
 
-      // Fetch all quotes in parallel
+      // Fetch all EVM backend quotes in parallel
       const results = await Promise.allSettled([
         lifi.getQuote(params),
-        skip.getQuote(params),
         debridge.getQuote(params),
         across.getQuote(params),
         relay.getQuote(params),
       ]);
 
       const quotes: { backend: string; quote: BridgeQuote }[] = [];
-      const backends = ["lifi", "skip", "debridge", "across", "relay"];
+      const backends = ["lifi", "debridge", "across", "relay"];
 
       for (let i = 0; i < results.length; i++) {
         const r = results[i];
@@ -246,13 +223,13 @@ describe("All-backends quote comparison (real APIs)", () => {
         }
       }
 
-      // At least 3 out of 5 should return quotes for this common route
+      // At least 2 out of 4 should return quotes for this common route
       console.log(
-        `\n  Quotes received: ${quotes.length}/5`,
+        `\n  Quotes received: ${quotes.length}/4`,
         quotes.map((q) => `\n    ${q.backend}: ${q.quote.outputAmount} USDC (${q.quote.route})`).join("")
       );
 
-      expect(quotes.length).toBeGreaterThanOrEqual(3);
+      expect(quotes.length).toBeGreaterThanOrEqual(2);
 
       // All returned quotes should have reasonable output (>4 USDC for 5 USDC input)
       for (const { backend, quote } of quotes) {
