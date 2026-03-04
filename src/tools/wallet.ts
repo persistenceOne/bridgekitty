@@ -28,14 +28,33 @@ export function getKey(name: "privateKey" | "mnemonic" | "solanaKey"): string | 
 }
 
 /**
- * Returns the BridgeKitty config directory. Resolution order:
- * 1. BRIDGEKITTY_HOME env var (if set)
- * 2. ~/.bridgekitty/
+ * Returns the BridgeKitty config directory. Resolution order (highest priority first):
+ * 1. BRIDGEKITTY_CONFIG env var → use as explicit path
+ * 2. ./.bridgekitty/ (local directory) → preferred for sandboxed agents
+ * 3. BRIDGEKITTY_HOME env var (if set)
+ * 4. ~/.bridgekitty/ (home directory) → traditional default
  *
  * Creates the directory if it doesn't exist (mode 0o700).
  */
 export function getConfigDir(): string {
-  const dir = process.env.BRIDGEKITTY_HOME || path.join(os.homedir(), ".bridgekitty");
+  let dir: string;
+
+  if (process.env.BRIDGEKITTY_CONFIG) {
+    // Explicit config path takes highest priority
+    dir = process.env.BRIDGEKITTY_CONFIG;
+  } else {
+    // Check local directory first (helps sandboxed agents)
+    const localDir = path.join(process.cwd(), ".bridgekitty");
+    const localEnv = path.join(localDir, ".env");
+    if (fs.existsSync(localEnv)) {
+      dir = localDir;
+    } else if (process.env.BRIDGEKITTY_HOME) {
+      dir = process.env.BRIDGEKITTY_HOME;
+    } else {
+      dir = path.join(os.homedir(), ".bridgekitty");
+    }
+  }
+
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
@@ -67,7 +86,7 @@ const DEFAULT_ERC20_TOKENS: Record<number, Array<{ symbol: string; address: stri
     { symbol: "USDT", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6 },
     { symbol: "WETH", address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", decimals: 18 },
     { symbol: "WBTC", address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", decimals: 8 },
-    { symbol: "cbBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
+    { symbol: "CBBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
   ],
   10: [ // Optimism
     { symbol: "USDC", address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", decimals: 6 },
@@ -100,7 +119,7 @@ const DEFAULT_ERC20_TOKENS: Record<number, Array<{ symbol: string; address: stri
   ],
   8453: [ // Base
     { symbol: "USDC", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6 },
-    { symbol: "cbBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
+    { symbol: "CBBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
     { symbol: "WETH", address: "0x4200000000000000000000000000000000000006", decimals: 18 },
   ],
 };
@@ -115,6 +134,7 @@ let priceCache: { prices: Record<string, number>; fetchedAt: number } | null = n
 // CoinGecko IDs for native tokens
 const COINGECKO_IDS: Record<string, string> = {
   ETH: "ethereum",
+  WETH: "ethereum",
   BNB: "binancecoin",
   POL: "matic-network",
   MATIC: "matic-network",
@@ -123,6 +143,9 @@ const COINGECKO_IDS: Record<string, string> = {
   XPRT: "persistence",
   SOL: "solana",
   BTC: "bitcoin",
+  WBTC: "bitcoin",
+  CBBTC: "bitcoin",
+  BTCB: "bitcoin",
   USDC: "usd-coin",
   USDT: "tether",
 };
@@ -435,8 +458,9 @@ export function registerWalletTools(server: McpServer) {
                   const bal: bigint = await contract.balanceOf(evmAddress);
                   const balance = ethers.formatUnits(bal, token.decimals);
                   return { key: `${chain.name} (${token.symbol})`, symbol: token.symbol, balance };
-                } catch {
-                  // Return zero balance so default tokens always appear in output
+                } catch (err) {
+                  // Log the error for debugging, return zero so default tokens always appear
+                  console.error(`[wallet] ERC20 balance check failed for ${token.symbol} on ${chain.name} (${token.address}): ${(err as Error).message?.slice(0, 100)}`);
                   return { key: `${chain.name} (${token.symbol})`, symbol: token.symbol, balance: "0" };
                 }
               })()
@@ -452,8 +476,8 @@ export function registerWalletTools(server: McpServer) {
             if (params.includeUsd) {
               // Map ERC-20 symbols to price keys
               const priceKey: Record<string, string> = {
-                USDC: "USDC", USDT: "USDT", WETH: "ETH", WBTC: "BTC",
-                cbBTC: "BTC", BTCB: "BTC", DAI: "USDC",
+                USDC: "USDC", USDT: "USDT", WETH: "WETH", WBTC: "WBTC",
+                CBBTC: "CBBTC", BTCB: "BTCB", DAI: "USDC",
               };
               const pk = priceKey[symbol];
               if (pk && prices[pk]) {
@@ -469,20 +493,132 @@ export function registerWalletTools(server: McpServer) {
         }
       }
 
-      // Persistence XPRT
+      // Persistence XPRT (liquid + staked + unbonding + rewards)
       if (chainsToCheck.includes("persistence") && mnemonic) {
         try {
           const { Secp256k1HdWallet } = await import("@cosmjs/amino");
           const wallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
           const [account] = await wallet.getAccounts();
-          const data = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${account.address}`);
-          const xprt = data.balances?.find((b: any) => b.denom === "uxprt");
-          const amount = xprt ? (parseInt(xprt.amount) / 1e6).toFixed(6) : "0";
-          const entry: BalanceEntry = { balance: amount, symbol: "XPRT" };
+          const address = account.address;
+
+          // Fetch all data in parallel
+          const [bankData, delegationsData, unbondingData, rewardsData] = await Promise.allSettled([
+            fetchJson(`https://rest.cosmos.directory/persistence/cosmos/bank/v1beta1/balances/${address}`),
+            fetchJson(`https://rest.cosmos.directory/persistence/cosmos/staking/v1beta1/delegations/${address}`),
+            fetchJson(`https://rest.cosmos.directory/persistence/cosmos/staking/v1beta1/delegators/${address}/unbonding_delegations`),
+            fetchJson(`https://rest.cosmos.directory/persistence/cosmos/distribution/v1beta1/delegators/${address}/rewards`),
+          ]);
+
+          // Parse liquid balance
+          const xprt = bankData.status === "fulfilled" ?
+            bankData.value.balances?.find((b: any) => b.denom === "uxprt") : null;
+          const liquidAmount = xprt ? (parseInt(xprt.amount) / 1e6) : 0;
+
+          // Parse staked balance
+          let stakedAmount = 0;
+          const delegations: Array<{ validator: string; amount: string }> = [];
+          if (delegationsData.status === "fulfilled" && delegationsData.value.delegation_responses) {
+            for (const del of delegationsData.value.delegation_responses) {
+              const amount = parseInt(del.balance?.amount || "0") / 1e6;
+              stakedAmount += amount;
+              delegations.push({
+                validator: del.delegation?.validator_address || "unknown",
+                amount: amount.toFixed(2),
+              });
+            }
+          }
+
+          // Parse unbonding balance
+          let unbondingAmount = 0;
+          if (unbondingData.status === "fulfilled" && unbondingData.value.unbonding_responses) {
+            for (const unbond of unbondingData.value.unbonding_responses) {
+              for (const entry of unbond.entries || []) {
+                unbondingAmount += parseInt(entry.balance || "0") / 1e6;
+              }
+            }
+          }
+
+          // Parse pending rewards
+          let pendingRewards = 0;
+          if (rewardsData.status === "fulfilled" && rewardsData.value.rewards) {
+            for (const reward of rewardsData.value.rewards) {
+              for (const coin of reward.reward || []) {
+                if (coin.denom === "uxprt") {
+                  pendingRewards += parseFloat(coin.amount || "0") / 1e6;
+                }
+              }
+            }
+          }
+
+          const totalPosition = liquidAmount + stakedAmount + unbondingAmount + pendingRewards;
+
+          // Determine multiplier tier from rewards API (canonical source)
+          let currentMultiplier = "1x";
+          let nextMultiplierTier: string | null = null;
+          let xprtNeededForNextTier: number | null = null;
+          let tierName = "Explorer";
+
+          try {
+            const today = new Date().toISOString().slice(0, 10);
+            const tierData = await fetchJson(
+              `https://rewards.interop.persistence.one/tiers/${address}?blockDate=${today}`
+            );
+            if (tierData.multiplier) {
+              currentMultiplier = `${tierData.multiplier}x`;
+            }
+            if (tierData.tier) {
+              tierName = tierData.tier;
+            }
+            if (tierData.nextMultiplierMilestone) {
+              const nextStake = tierData.nextMultiplierMilestone.stake;
+              const nextMult = tierData.nextMultiplierMilestone.multiplier;
+              nextMultiplierTier = `${nextMult}x`;
+              xprtNeededForNextTier = Math.max(0, nextStake - stakedAmount);
+            }
+          } catch {
+            // Fallback to hardcoded tiers if API is unavailable
+            if (stakedAmount >= 1000000) {
+              currentMultiplier = "5x";
+              tierName = "Pioneer";
+            } else if (stakedAmount >= 10000) {
+              currentMultiplier = "3x";
+              tierName = "Voyager";
+              nextMultiplierTier = "5x";
+              xprtNeededForNextTier = 1000000 - stakedAmount;
+            } else {
+              currentMultiplier = "1x";
+              tierName = "Explorer";
+              nextMultiplierTier = "3x";
+              xprtNeededForNextTier = 10000 - stakedAmount;
+            }
+          }
+
+          const persistenceBalance: any = {
+            liquid: liquidAmount.toFixed(6),
+            staked: stakedAmount.toFixed(2),
+            unbonding: unbondingAmount.toFixed(2),
+            pendingRewards: pendingRewards.toFixed(2),
+            totalPosition: totalPosition.toFixed(2),
+            currentMultiplier,
+            tier: tierName,
+            delegations,
+          };
+
+          if (nextMultiplierTier) {
+            persistenceBalance.nextMultiplierTier = nextMultiplierTier;
+            persistenceBalance.xprtNeededForNextTier = xprtNeededForNextTier?.toFixed(0);
+          }
+
+          // Create balance entry with total position
+          const entry: BalanceEntry = { balance: totalPosition.toFixed(6), symbol: "XPRT" };
           if (params.includeUsd) {
             const price = prices["XPRT"];
-            entry.usdValue = price ? Math.round(parseFloat(amount) * price * 100) / 100 : null;
+            entry.usdValue = price ? Math.round(totalPosition * price * 100) / 100 : null;
           }
+
+          // Add the detailed structure to the entry
+          (entry as any).details = persistenceBalance;
+
           balances["persistence (XPRT)"] = entry;
         } catch (err) {
           balances["persistence (XPRT)"] = { balance: `error: ${sanitizeError(err as Error)}`, symbol: "XPRT", usdValue: null };

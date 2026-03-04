@@ -5,6 +5,7 @@ import { ethers } from "ethers";
 import * as path from "path";
 
 const REWARDS_API = "https://rewards.interop.persistence.one";
+const PERSISTENCE_REST = "https://rest.cosmos.directory/persistence";
 const TIMEOUT_MS = 15_000;
 
 async function fetchJson(url: string): Promise<any> {
@@ -68,35 +69,61 @@ export function registerXprtRewardsCheck(server: McpServer) {
       // Fetch reward data
       try {
         const rewardData = await fetchJson(`${REWARDS_API}/rewards/${evmAddress}`);
-        result.totalXprtEarned = rewardData.totalXprtEarned ?? "unknown";
-        result.pendingXprtRewards = rewardData.pendingXprtRewards ?? "unknown";
-        result.nextDistributionDate = rewardData.nextDistributionDate ?? "unknown";
-        result.currentMultiplier = rewardData.currentMultiplier ?? "unknown";
-        result.qualifyingVolumeBtc = rewardData.qualifyingVolumeBtc ?? "unknown";
-        result.lifetimeVolumeBtc = rewardData.lifetimeVolumeBtc ?? "unknown";
+        result.totalXprtEarned = rewardData.totalXprtEarned ?? "not_yet_tracked";
+        result.pendingXprtRewards = rewardData.pendingXprtRewards ?? "pending_epoch_close";
+        result.nextDistributionDate = rewardData.nextDistributionDate ?? "pending_epoch_close";
+        result.currentMultiplier = rewardData.currentMultiplier ?? "not_yet_determined";
+        result.qualifyingVolumeBtc = rewardData.qualifyingVolumeBtc ?? "no_qualifying_volume";
+        result.lifetimeVolumeBtc = rewardData.lifetimeVolumeBtc ?? "no_volume_recorded";
       } catch {
-        result.totalXprtEarned = "unknown";
-        result.pendingXprtRewards = "unknown";
-        result.nextDistributionDate = "unknown";
-        result.currentMultiplier = "unknown";
-        result.qualifyingVolumeBtc = "unknown";
-        result.lifetimeVolumeBtc = "unknown";
+        result.totalXprtEarned = "not_yet_tracked";
+        result.pendingXprtRewards = "pending_epoch_close";
+        result.nextDistributionDate = "pending_epoch_close";
+        result.currentMultiplier = "not_yet_determined";
+        result.qualifyingVolumeBtc = "no_qualifying_volume";
+        result.lifetimeVolumeBtc = "no_volume_recorded";
       }
 
       // Fetch current epoch data
       try {
         const epochData = await fetchJson(`${REWARDS_API}/epochs/current`);
-        result.currentEpoch = {
-          epochNumber: epochData.epochNumber ?? "unknown",
-          startDate: epochData.startDate ?? "unknown",
-          endDate: epochData.endDate ?? "unknown",
-          status: epochData.status ?? "unknown",
+        const currentEpoch: any = {
+          epochNumber: epochData.epochNumber ?? "not_available",
+          startDate: epochData.startDate ?? "not_available",
+          endDate: epochData.endDate ?? "not_available",
+          status: epochData.status ?? "not_available",
           rewardPoolXprt: epochData.rewardPoolXprt
             ? `~${Number(epochData.rewardPoolXprt).toFixed(2)} XPRT`
-            : "unknown",
+            : "not_available",
         };
+
+        // Calculate time remaining if endDate is available
+        if (epochData.endDate && epochData.endDate !== "not_available") {
+          try {
+            const endTime = new Date(epochData.endDate).getTime();
+            const now = Date.now();
+            if (endTime > now) {
+              const diffMs = endTime - now;
+              const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+              const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+              currentEpoch.endsIn = `${diffHours}h ${diffMinutes}m`;
+            } else {
+              currentEpoch.endsIn = "epoch_closed";
+            }
+          } catch {
+            currentEpoch.endsIn = "calculation_failed";
+          }
+        } else {
+          currentEpoch.endsIn = "end_time_unknown";
+        }
+
+        result.currentEpoch = currentEpoch;
       } catch {
-        result.currentEpoch = "unknown";
+        result.currentEpoch = {
+          epochNumber: "api_unavailable",
+          status: "api_unavailable",
+          endsIn: "api_unavailable",
+        };
       }
 
       // Fetch address link status
@@ -112,7 +139,48 @@ export function registerXprtRewardsCheck(server: McpServer) {
         result.persistenceAddressLinked = "unknown";
       }
 
-      result.disclaimer = "Rewards are estimated and not guaranteed.";
+      // Try to fetch staking data if mnemonic is available to enhance currentMultiplier
+      const mnemonic = getKey("mnemonic");
+      if (mnemonic && (result.currentMultiplier === "not_yet_determined" || result.currentMultiplier === "unknown")) {
+        try {
+          const { Secp256k1HdWallet } = await import("@cosmjs/amino");
+          const wallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
+          const [account] = await wallet.getAccounts();
+          const persistenceAddress = account.address;
+
+          // Fetch staking delegations
+          const delegationsData = await fetchJson(`${PERSISTENCE_REST}/cosmos/staking/v1beta1/delegations/${persistenceAddress}`);
+
+          let totalStaked = 0;
+          if (delegationsData.delegation_responses) {
+            for (const del of delegationsData.delegation_responses) {
+              totalStaked += parseInt(del.balance?.amount || "0");
+            }
+          }
+
+          const stakedXprt = totalStaked / 1e6;
+
+          // Determine multiplier tier from staked amount
+          if (stakedXprt >= 1000000) {
+            result.currentMultiplier = "5x";
+          } else if (stakedXprt >= 10000) {
+            result.currentMultiplier = "2x";
+          } else {
+            result.currentMultiplier = "1x";
+          }
+
+          result.stakingInfo = {
+            stakedXprt: stakedXprt.toFixed(2),
+            multiplierFromStaking: result.currentMultiplier,
+            note: "Multiplier determined from current staking position"
+          };
+        } catch {
+          // If staking data fetch fails, keep the original value
+        }
+      }
+
+      result.estimatedRewardNote = "Rewards depend on total participation in each epoch. Estimates may change based on network-wide bridging volume and staking multipliers.";
+      result.disclaimer = "Rewards are estimated and not guaranteed. Actual rewards distributed after epoch close.";
 
       return {
         content: [{

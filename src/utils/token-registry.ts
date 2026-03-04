@@ -15,7 +15,7 @@
  * Agents can always pass raw 0x addresses to bypass the registry.
  */
 
-import { getChainName, PERSISTENCE_CHAIN_ID, COSMOSHUB_CHAIN_ID } from "./chains.js";
+import { getChainName, PERSISTENCE_CHAIN_ID, COSMOSHUB_CHAIN_ID, SOLANA_CHAIN_ID } from "./chains.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -137,6 +137,7 @@ export const VERIFIED_TOKENS: VerifiedToken[] = [
       42161: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",   // Arbitrum (native)
       8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",    // Base (native)
       43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",   // Avalanche (native)
+      [SOLANA_CHAIN_ID]: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // Solana (native)
     },
   },
   {
@@ -164,6 +165,7 @@ export const VERIFIED_TOKENS: VerifiedToken[] = [
       42161: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",   // Arbitrum
       43114: "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7",   // Avalanche
       8453: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",    // Base
+      [SOLANA_CHAIN_ID]: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // Solana
     },
   },
   {
@@ -559,6 +561,17 @@ export const VERIFIED_TOKENS: VerifiedToken[] = [
     addresses: {
       // Cosmos Hub uses uatom denom
       [COSMOSHUB_CHAIN_ID]: "uatom",
+    },
+  },
+
+  // ── Solana Tokens ──────────────────────────────────────────────────────
+
+  {
+    symbol: "SOL",
+    name: "Solana",
+    decimals: 9,
+    addresses: {
+      [SOLANA_CHAIN_ID]: "So11111111111111111111111111111111111111112", // Wrapped SOL mint
     },
   },
 ];

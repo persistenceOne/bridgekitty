@@ -31,6 +31,12 @@ export interface FeeBreakdown {
   integratorFeeUsd: number;
   integratorFeePercent: string | null; // e.g. "0.3%" or null if none
   totalFeeUsd: number | null; // null if gas is unknown
+  // deBridge-specific: flat protocol fee in native token (e.g. 0.001 ETH)
+  fixFeeNativeRaw?: string;
+  // Operating expense prepended to the source amount
+  operatingExpenseRaw?: string;
+  // Total source amount the user actually needs (input + operating expenses)
+  totalSourceAmountRaw?: string;
 }
 
 export interface BridgeQuote {
@@ -78,6 +84,14 @@ export interface TransactionRequest {
     types: Record<string, unknown>;
     value: Record<string, unknown>;
     description: string;
+  };
+  /**
+   * Solana transaction data. When present, the source chain is Solana and the agent
+   * must sign/send this as a Solana transaction (not EVM).
+   * `serializedTx` is a base58-encoded versioned transaction.
+   */
+  solanaTransaction?: {
+    serializedTx: string;
   };
 }
 

@@ -407,14 +407,16 @@ describe("getRegistryStats", () => {
 // ─── Registry Data Integrity ────────────────────────────────────────────────
 
 describe("registry data integrity", () => {
-  it("all addresses are valid hex format or Cosmos denom", () => {
+  it("all addresses are valid hex format, Cosmos denom, or Solana base58", () => {
     // EVM addresses: 0x + 40 hex chars.
     // Cosmos denoms (e.g. uxprt, uatom, ibc/..., stk/uatom) are NOT hex — allow them.
+    // Solana addresses: base58-encoded, 32-44 chars (e.g. EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)
     const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
     const COSMOS_DENOM = /^(u[a-z]+|ibc\/[A-F0-9]+|stk\/.+)$/;
+    const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
     for (const token of VERIFIED_TOKENS) {
       for (const [chainId, address] of Object.entries(token.addresses)) {
-        const valid = EVM_ADDRESS.test(address) || COSMOS_DENOM.test(address);
+        const valid = EVM_ADDRESS.test(address) || COSMOS_DENOM.test(address) || SOLANA_ADDRESS.test(address);
         expect(valid).toBe(
           true,
           `Invalid address for ${token.symbol} on chain ${chainId}: ${address}`

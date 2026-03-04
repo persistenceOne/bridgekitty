@@ -57,7 +57,7 @@ async function getBalance(chainId: number, tokenAddress: string, wallet: string)
 
 function getMultiplierTier(xprtStaked: number): { tier: string; multiplier: string } {
   if (xprtStaked >= 1_000_000) return { tier: "Pioneer", multiplier: "5x" };
-  if (xprtStaked >= 10_000) return { tier: "Voyager", multiplier: "2x" };
+  if (xprtStaked >= 10_000) return { tier: "Voyager", multiplier: "3x" };
   return { tier: "Explorer", multiplier: "1x" };
 }
 
@@ -318,6 +318,7 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       fillTimeout: z.number().default(180).describe("Max seconds to wait for each leg fill (default 180, minimum 90)"),
       maxFailures: z.number().default(3).describe("Stop after N consecutive failures (default 3)"),
       maxLossBps: z.number().default(200).describe("Stop if cumulative loss exceeds N basis points (default 200 = 2%)"),
+      dryRun: z.boolean().optional().describe("Preview the farming operation without executing transactions (default: false)"),
     },
     async (params) => {
       const privateKey = getKey("privateKey");
@@ -421,6 +422,85 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       } catch { /* non-fatal */ }
 
       const directionLabel = resolvedStartFrom === "bsc" ? "BSC→Base→BSC" : "Base→BSC→Base";
+
+      // ── Dry Run Preview ──────────────────────────────────────────────
+      if (params.dryRun) {
+        progress("DRY RUN: Generating preview without executing...");
+        
+        // Get current balances
+        let leg1BalanceRaw = "0";
+        let leg2BalanceRaw = "0";
+        try {
+          leg1BalanceRaw = await getBalance(leg1.chainId, leg1.token, walletAddress);
+          leg2BalanceRaw = await getBalance(leg2.destChainId, leg2.destToken, walletAddress);
+        } catch (err) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `DRY RUN FAILED: Could not fetch balances - ${(err as Error).message}`,
+            }],
+            isError: true,
+          };
+        }
+
+        const leg1Balance = ethers.formatUnits(leg1BalanceRaw, leg1.decimals);
+        const leg2Balance = ethers.formatUnits(leg2BalanceRaw, leg2.decimals);
+
+        // Get a quote for leg 1 to estimate output
+        let estimatedOutput = "unknown";
+        let estimatedLoss = "unknown";
+        try {
+          const clamped = await getClampedAmount(leg1.chainId, leg1.token, walletAddress, leg1.decimals, userCapBtc);
+          if (clamped) {
+            const quoteParams = {
+              fromChainId: leg1.chainId,
+              toChainId: leg1.destChainId,
+              fromTokenAddress: leg1.token,
+              toTokenAddress: leg1.destToken,
+              amountRaw: clamped.amountRaw,
+              fromAddress: walletAddress,
+              preference: "fastest" as const,
+            };
+            const quote = await persistence.getQuote(quoteParams);
+            if (quote) {
+              const outputBtc = Number(quote.minOutputAmountRaw) / (leg1.destToken === CBTCB_BASE ? 1e8 : 1e18);
+              const inputBtc = Number(clamped.amountRaw) / (leg1.token === CBTCB_BASE ? 1e8 : 1e18);
+              const lossBps = Math.round(((inputBtc - outputBtc) / inputBtc) * 10000);
+              estimatedOutput = outputBtc.toFixed(8);
+              estimatedLoss = `~${lossBps} bps (${(lossBps / 100).toFixed(2)}%)`;
+            }
+          }
+        } catch {
+          // Quote failed, keep unknown
+        }
+
+        const preview = {
+          dryRun: true,
+          preview: {
+            direction: directionLabel,
+            inputAmount: `${leg1Balance} ${leg1.label.includes("Base") ? "cbBTC" : "BTCB"}`,
+            estimatedOutput: estimatedOutput === "unknown" ? "unknown" : `${estimatedOutput} ${leg1.label.includes("BSC") ? "BTCB" : "cbBTC"}`,
+            estimatedSingleLegLoss: estimatedLoss,
+            estimatedRoundTripLoss: estimatedLoss === "unknown" ? "unknown" : `~${parseInt(estimatedLoss) * 2} bps`,
+            estimatedGas: "<$0.01 per leg on L2",
+            rounds: params.rounds,
+            totalEstimatedTime: `~${Math.ceil(params.rounds * (effectiveTimeout * 2 + params.delay) / 60)} minutes`,
+            balances: {
+              [leg1.label.split("→")[0]]: `${leg1Balance} ${leg1.label.includes("Base") ? "cbBTC" : "BTCB"}`,
+              [leg2.label.split("→")[0]]: `${leg2Balance} ${leg2.label.includes("Base") ? "cbBTC" : "BTCB"}`,
+            },
+            note: "Set dryRun=false to execute the farming operation.",
+          },
+        };
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(preview, null, 2),
+          }],
+        };
+      }
+
       progress(`Starting ${params.rounds} rounds, direction: ${directionLabel}, fillTimeout: ${effectiveTimeout}s`);
 
       for (let i = 0; i < params.rounds; i++) {
@@ -810,13 +890,28 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
       try {
         const linkData = await fetchJson(`${REWARDS_API}/address-verification/check/${walletAddress}`);
         if (linkData.isRegistered && linkData.persistenceAddress) {
-          const balData = await fetchJson(`${PERSISTENCE_REST}/cosmos/bank/v1beta1/balances/${linkData.persistenceAddress}`);
-          const xprt = balData.balances?.find((b: any) => b.denom === "uxprt");
-          const xprtStaked = xprt ? parseInt(xprt.amount) / 1e6 : 0;
-          const tier = getMultiplierTier(xprtStaked);
-          currentMultiplier = tier.multiplier;
-          if (tier.tier === "Explorer") nextMultiplierThreshold = "Stake 10,000 XPRT to reach 2x multiplier";
-          else if (tier.tier === "Voyager") nextMultiplierThreshold = "Stake 1,000,000 XPRT to reach 5x multiplier";
+          // Check multiplier from rewards API first (canonical), then fall back to delegation query
+          const today = new Date().toISOString().slice(0, 10);
+          let resolved = false;
+          try {
+            const tierData = await fetchJson(`${REWARDS_API}/tiers/${linkData.persistenceAddress}?blockDate=${today}`);
+            if (tierData.multiplier) {
+              currentMultiplier = `${tierData.multiplier}x`;
+              resolved = true;
+            }
+          } catch { /* fall through to delegation-based lookup */ }
+
+          if (!resolved) {
+            // Fallback: check staked (delegated) balance — not liquid balance!
+            const delData = await fetchJson(`${PERSISTENCE_REST}/cosmos/staking/v1beta1/delegations/${linkData.persistenceAddress}`);
+            const totalDelegated = (delData.delegation_responses ?? []).reduce((sum: number, d: any) => {
+              return sum + parseInt(d.balance?.amount ?? "0") / 1e6;
+            }, 0);
+            const tier = getMultiplierTier(totalDelegated);
+            currentMultiplier = tier.multiplier;
+            if (tier.tier === "Explorer") nextMultiplierThreshold = "Stake 10,000 XPRT to reach 2x multiplier";
+            else if (tier.tier === "Voyager") nextMultiplierThreshold = "Stake 1,000,000 XPRT to reach 5x multiplier";
+          }
         }
       } catch { /* non-fatal */ }
 
@@ -1054,24 +1149,276 @@ export function registerXprtFarmTools(server: McpServer, engine: RoutingEngine) 
         };
       }
 
-      // Execute mode — currently requires manual XPRT acquisition
+      // ── Execute mode: Bridge EVM token → XPRT → auto-stake ──────────────
+      progress(`Boost execute: ${params.amount} ${params.token} on ${params.chain} → XPRT → stake`);
+
+      // Step 1: Resolve chain and token
+      const { resolveChainId } = await import("../utils/chains.js");
+      const { resolveToken } = await import("../utils/token-registry.js");
+      const { parseTokenAmount } = await import("../utils/tokens.js");
+      const { PERSISTENCE_CHAIN_ID } = await import("../utils/chains.js");
+
+      const fromChainId = resolveChainId(params.chain);
+      if (!fromChainId) {
+        return {
+          content: [{ type: "text" as const, text: `Unknown chain: ${params.chain}` }],
+          isError: true,
+        };
+      }
+
+      const fromTokenResult = resolveToken(params.token, fromChainId);
+      if (!fromTokenResult.ok) {
+        return {
+          content: [{ type: "text" as const, text: `Token resolution failed: ${fromTokenResult.error}` }],
+          isError: true,
+        };
+      }
+
+      const toTokenResult = resolveToken("XPRT", PERSISTENCE_CHAIN_ID);
+      if (!toTokenResult.ok) {
+        return {
+          content: [{ type: "text" as const, text: `XPRT token resolution failed: ${toTokenResult.error}` }],
+          isError: true,
+        };
+      }
+
+      const amountRaw = parseTokenAmount(params.amount, fromTokenResult.decimals);
+      const privateKey = getKey("privateKey");
+      if (!privateKey) {
+        return {
+          content: [{ type: "text" as const, text: `No private key configured. Run wallet_setup first.` }],
+          isError: true,
+        };
+      }
+      const evmWallet = new ethers.Wallet(privateKey);
+
+      // Step 2: Get Squid quote (only backend supporting EVM → Cosmos)
+      progress("Getting Squid quote for EVM → XPRT...");
+      const squidBackend = engine.getBackend("squid");
+      if (!squidBackend) {
+        return {
+          content: [{ type: "text" as const, text: `Squid backend not available. Cannot bridge to Cosmos.` }],
+          isError: true,
+        };
+      }
+
+      const quote = await squidBackend.getQuote({
+        fromChainId,
+        toChainId: PERSISTENCE_CHAIN_ID,
+        fromTokenAddress: fromTokenResult.address,
+        toTokenAddress: toTokenResult.address,
+        amountRaw,
+        fromAddress: evmWallet.address,
+        preference: "fastest",
+        fromTokenDecimals: fromTokenResult.decimals,
+        toTokenDecimals: toTokenResult.decimals,
+      });
+
+      if (!quote) {
+        return {
+          content: [{ type: "text" as const, text: `No Squid route found for ${params.amount} ${params.token} (${params.chain}) → XPRT. Try a different token or chain.` }],
+          isError: true,
+        };
+      }
+
+      progress(`Quote: ~${quote.minOutputAmount} XPRT, ETA: ${quote.estimatedTimeSeconds}s`);
+
+      // Step 3: Build unsigned transaction
+      const txRequest = await squidBackend.buildTransaction(quote);
+
+      // Step 4: Sign and broadcast on EVM chain
+      progress("Signing and broadcasting bridge tx...");
+      const provider = await getProvider(fromChainId);
+      const signer = evmWallet.connect(provider);
+
+      // Check balance
+      const balance = await provider.getBalance(evmWallet.address);
+      if (balance < BigInt(amountRaw)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Insufficient balance",
+              balance: ethers.formatEther(balance),
+              required: params.amount,
+              token: params.token,
+              chain: params.chain,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Send approval tx if needed
+      if (txRequest.approvalTx) {
+        progress("Sending token approval...");
+        const approvalTx = await signer.sendTransaction({
+          to: txRequest.approvalTx.to,
+          data: txRequest.approvalTx.data,
+          value: txRequest.approvalTx.value,
+          chainId: txRequest.approvalTx.chainId,
+        });
+        await approvalTx.wait();
+        progress(`Approval confirmed: ${approvalTx.hash}`);
+      }
+
+      // Send bridge tx
+      const tx = await signer.sendTransaction({
+        to: txRequest.to,
+        data: txRequest.data,
+        value: txRequest.value,
+        chainId: txRequest.chainId,
+        gasLimit: txRequest.gasLimit ? BigInt(txRequest.gasLimit) : undefined,
+      });
+
+      progress(`Bridge tx sent: ${tx.hash}`);
+      const receipt = await tx.wait();
+
+      if (receipt?.status !== 1) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Bridge transaction failed on-chain",
+              txHash: tx.hash,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      progress("Bridge tx confirmed on source chain. Waiting for XPRT to arrive on Persistence...");
+
+      // Step 5: Poll for XPRT arrival on Persistence (up to 30 minutes)
+      const preLiquidBalance = await (async () => {
+        try {
+          const balData = await fetchJson(`https://rest.cosmos.directory/persistence/cosmos/bank/v1beta1/balances/${persistenceAddress}`);
+          const xprt = balData.balances?.find((b: any) => b.denom === "uxprt");
+          return parseInt(xprt?.amount || "0");
+        } catch { return 0; }
+      })();
+
+      const MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
+      const POLL_MS = 30_000; // check every 30s
+      const startTime = Date.now();
+      let xprtReceived = 0;
+
+      while (Date.now() - startTime < MAX_WAIT_MS) {
+        await new Promise(r => setTimeout(r, POLL_MS));
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        progress(`Waiting for XPRT... (${elapsed}s elapsed)`);
+
+        try {
+          const balData = await fetchJson(`https://rest.cosmos.directory/persistence/cosmos/bank/v1beta1/balances/${persistenceAddress}`);
+          const xprt = balData.balances?.find((b: any) => b.denom === "uxprt");
+          const currentBalance = parseInt(xprt?.amount || "0");
+          if (currentBalance > preLiquidBalance) {
+            xprtReceived = (currentBalance - preLiquidBalance) / 1e6;
+            progress(`XPRT arrived! Received: ${xprtReceived.toFixed(2)} XPRT`);
+            break;
+          }
+        } catch {
+          // LCD query failed, keep polling
+        }
+      }
+
+      if (xprtReceived === 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "bridge_pending",
+              message: "Bridge tx confirmed but XPRT hasn't arrived yet after 30 minutes. It may still be in transit via Axelar/IBC.",
+              txHash: tx.hash,
+              persistenceAddress,
+              action: "Check wallet_balance later, then run xprt_stake manually once XPRT arrives.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Step 6: Auto-stake the received XPRT
+      progress(`Staking ${xprtReceived.toFixed(2)} XPRT...`);
+      let stakeTxHash = "not_executed";
+      let stakeError: string | null = null;
+
+      try {
+        const { SigningStargateClient } = await import("@cosmjs/stargate");
+        const { Secp256k1HdWallet: StakeWallet } = await import("@cosmjs/amino");
+        const stakeWallet = await StakeWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
+
+        const rpc = "https://persistence-rpc.polkachu.com";
+        const client = await SigningStargateClient.connectWithSigner(rpc, stakeWallet);
+
+        // Pick validator (use provided or auto-select)
+        let validatorAddr = params.validatorAddress;
+        if (!validatorAddr) {
+          try {
+            const validatorsData = await fetchJson(`https://rest.cosmos.directory/persistence/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=100`);
+            const validators = (validatorsData.validators || [])
+              .filter((v: any) => !v.jailed && v.status === "BOND_STATUS_BONDED")
+              .sort((a: any, b: any) => parseInt(b.tokens || "0") - parseInt(a.tokens || "0"));
+            if (validators.length > 0) {
+              validatorAddr = validators[0].operator_address;
+              progress(`Auto-selected validator: ${validators[0].description?.moniker || validatorAddr}`);
+            }
+          } catch { /* fallback below */ }
+        }
+
+        if (!validatorAddr) {
+          stakeError = "No validator available. XPRT received but not staked. Use xprt_stake to delegate manually.";
+        } else {
+          // Leave a small amount for gas (~0.1 XPRT)
+          const stakeAmountUxprt = Math.floor((xprtReceived - 0.1) * 1e6);
+          if (stakeAmountUxprt <= 0) {
+            stakeError = "Received amount too small to stake after reserving gas. Use xprt_stake manually.";
+          } else {
+            const msg = {
+              typeUrl: "/cosmos.staking.v1beta1.MsgDelegate",
+              value: {
+                delegatorAddress: persistenceAddress,
+                validatorAddress: validatorAddr,
+                amount: { denom: "uxprt", amount: String(stakeAmountUxprt) },
+              },
+            };
+
+            const fee = { amount: [{ denom: "uxprt", amount: "5000" }], gas: "250000" };
+            const result = await client.signAndBroadcast(persistenceAddress, [msg], fee, "BridgeKitty auto-stake");
+
+            if (result.code === 0) {
+              stakeTxHash = result.transactionHash;
+              progress(`Staked! Tx: ${stakeTxHash}`);
+            } else {
+              stakeError = `Staking tx failed with code ${result.code}: ${result.rawLog}`;
+            }
+          }
+        }
+      } catch (err) {
+        stakeError = `Staking failed: ${sanitizeError(err as Error)}. XPRT received but not staked — use xprt_stake manually.`;
+      }
+
+      // Calculate new tier
+      const newStakedTotal = currentXprtStaked + (stakeError ? 0 : xprtReceived);
+      const newTier = getMultiplierTier(newStakedTotal);
+
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
-            status: "manual_required",
-            message: "To boost your XPRT farming multiplier, acquire XPRT and send it to your Persistence address:",
-            steps: [
-              `1. Buy XPRT on Osmosis DEX, Gate.io, or Huobi`,
-              `2. Send XPRT to your Persistence address: ${persistenceAddress}`,
-              `3. Run xprt_farm_boost again after funding — it will auto-stake your XPRT`,
-            ],
+            status: stakeError ? "bridge_success_stake_failed" : "completed",
+            message: stakeError
+              ? `Successfully bridged ${params.amount} ${params.token} → ${xprtReceived.toFixed(2)} XPRT, but staking failed.`
+              : `Successfully bridged ${params.amount} ${params.token} → ${xprtReceived.toFixed(2)} XPRT and auto-staked!`,
+            bridgeTxHash: tx.hash,
+            stakeTxHash: stakeError ? null : stakeTxHash,
+            stakeError: stakeError || undefined,
+            xprtReceived: xprtReceived.toFixed(2),
             persistenceAddress,
-            currentState: {
-              currentXprtStaked: currentXprtStaked.toFixed(2),
-              currentTier: currentTier.tier,
-              currentMultiplier: currentTier.multiplier,
-            },
+            previousMultiplier: currentTier.multiplier,
+            newMultiplier: newTier.multiplier,
+            newTier: newTier.tier,
+            totalStaked: newStakedTotal.toFixed(2),
+            warning: "⚠️ Staked XPRT is locked for 21 days if you unstake. Use xprt_unstake to initiate unbonding.",
             tiers: {
               Explorer: "0 XPRT staked → 1x multiplier",
               Voyager: "10,000 XPRT staked → 2x multiplier",

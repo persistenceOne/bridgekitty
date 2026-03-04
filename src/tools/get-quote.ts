@@ -2,7 +2,7 @@ import { z } from "zod";
 import { ethers } from "ethers";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
-import { resolveChainId, getChainName, isCosmosChain } from "../utils/chains.js";
+import { resolveChainId, getChainName, isCosmosChain, isSolanaChain, SOLANA_CHAIN_ID } from "../utils/chains.js";
 import { resolveToken } from "../utils/token-registry.js";
 import { parseTokenAmount } from "../utils/tokens.js";
 import { BackendValidationError } from "../backends/types.js";
@@ -86,7 +86,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
       amount: z
         .string()
         .describe("Amount in human-readable units (e.g. '100' for 100 USDC)"),
-      fromAddress: z.string().describe("Sender wallet address (0x...)"),
+      fromAddress: z.string().describe("Sender wallet address (0x... for EVM, base58 for Solana)"),
       toAddress: z
         .string()
         .optional()
@@ -101,6 +101,38 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         .describe("Optional: only query specific providers (e.g. ['squid', 'lifi']). Default: query all."),
     },
     async (params) => {
+      // Helper: resolve toAddress for non-EVM destinations (Solana, Cosmos)
+      async function resolveToAddress(toAddress: string | undefined, destChainId: number): Promise<string | undefined> {
+        if (toAddress) return toAddress;
+        if (!isSolanaChain(destChainId)) return undefined;
+        // Auto-derive Solana address from wallet's Solana key
+        try {
+          const { getKey } = await import("./wallet.js");
+          const solanaKey = getKey("solanaKey");
+          if (solanaKey) {
+            const bs58 = await import("bs58");
+            const { Keypair } = await import("@solana/web3.js");
+            const secretKey = bs58.default.decode(solanaKey);
+            const keypair = Keypair.fromSecretKey(secretKey);
+            return keypair.publicKey.toBase58();
+          }
+          // Fall back to mnemonic-derived address
+          const mnemonic = getKey("mnemonic");
+          if (mnemonic) {
+            const { derivePath } = await import("ed25519-hd-key") as any;
+            const bip39 = await import("@scure/bip39") as any;
+            const { Keypair } = await import("@solana/web3.js");
+            const seed = await bip39.mnemonicToSeed(mnemonic);
+            const derivedSeed = derivePath("m/44'/501'/0'/0'", seed.toString("hex")).key;
+            const keypair = Keypair.fromSeed(derivedSeed);
+            return keypair.publicKey.toBase58();
+          }
+        } catch {
+          // Non-fatal — Solana key derivation failed, quote will still work without toAddress
+        }
+        return undefined;
+      }
+
       // Resolve chains
       const fromChainId = resolveChainId(params.fromChain);
       const toChainId = resolveChainId(params.toChain);
@@ -238,7 +270,7 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           toTokenAddress,
           amountRaw,
           fromAddress: params.fromAddress,
-          toAddress: params.toAddress,
+          toAddress: await resolveToAddress(params.toAddress, toChainId),
           preference: params.preference,
           fromTokenDecimals: decimals,
           toTokenDecimals: toDecimals,
@@ -308,6 +340,11 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           return "unknown";
         }
         if (q.estimatedGasCostUsd > 0) {
+          // For very small but non-zero amounts, show "<$0.01" instead of "$0.00"
+          if (q.estimatedGasCostUsd < 0.01) {
+            const marker = GAS_ESTIMATED_BACKENDS.has(q.backendName) ? "~" : "";
+            return `${marker}<$0.01`;
+          }
           // Backends where we estimate gas ourselves get the "~" and "(est)" markers
           if (GAS_ESTIMATED_BACKENDS.has(q.backendName)) {
             return `~$${q.estimatedGasCostUsd.toFixed(2)} (est)`;
@@ -315,6 +352,37 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           return `$${q.estimatedGasCostUsd.toFixed(2)}`;
         }
         return "$0.00";
+      }
+
+      function getFeeModel(q: typeof quotes[number]): string {
+        switch (q.backendName) {
+          case "relay":
+            return "gas_included_in_spread";
+          case "persistence":
+            return "gasless_relay";
+          case "lifi":
+          case "squid":
+          case "debridge":
+          case "across":
+          default:
+            return "user_pays_gas";
+        }
+      }
+
+      // L2 chains with typically very low gas costs
+      const L2_CHAINS = new Set([
+        10, 137, 324, 8453, 42161, 42170, 59144, 534352, 1101, 81457, 7777777,
+        34443, 204, 1088, 5000, 288, 252, 690, 1135, 1329, 1868, 1923, 2741,
+        7560, 13371, 33139, 167000, 60808, 1750, 2522, 232, 999, 360, 1514,
+        810180, 4326, 9745
+      ]);
+
+      function getGasEstimateNote(chainId: number): string | null {
+        if (L2_CHAINS.has(chainId)) {
+          const chainName = getChainName(chainId);
+          return `Gas on ${chainName} L2 is typically <$0.01`;
+        }
+        return null;
       }
 
       function buildTags(q: typeof quotes[number]): string[] {
@@ -336,10 +404,12 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         const expiresInSeconds = q.expiresAt
           ? Math.max(0, Math.round((q.expiresAt - Date.now()) / 1000))
           : null;
-        return {
+        const gasNote = fromChainId ? getGasEstimateNote(fromChainId) : null;
+        const quote: any = {
           provider: q.provider,
           youReceiveMin: `${q.minOutputAmount} ${toSymbol}`,
           estimatedGasFee: formatGasFee(q),
+          feeModel: getFeeModel(q),
           estimatedTime: formatTime(q.estimatedTimeSeconds),
           route: q.route,
           tags: buildTags(q),
@@ -347,6 +417,40 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           expiresAt: q.expiresAt ? new Date(q.expiresAt).toISOString() : null,
           expiresInSeconds,
         };
+        if (gasNote) {
+          quote.gasEstimateNote = gasNote;
+        }
+
+        // Surface protocol fees (deBridge fixFee, operating expenses) so agents know the REAL cost
+        const fb = q.feeBreakdown as any;
+        if (fb?.fixFeeNativeRaw && fb.fixFeeNativeRaw !== "0") {
+          const fixFeeEth = Number(BigInt(fb.fixFeeNativeRaw)) / 1e18;
+          const cid = fromChainId!;
+          const nativeSymbol = [56].includes(cid) ? "BNB"
+            : [137].includes(cid) ? "MATIC"
+            : [43114].includes(cid) ? "AVAX"
+            : "ETH";
+          quote.protocolFee = `${fixFeeEth.toFixed(6)} ${nativeSymbol}`;
+          // Total the user actually pays (input + fees), formatted
+          if (fb.totalSourceAmountRaw) {
+            const totalSrc = Number(BigInt(fb.totalSourceAmountRaw)) / (10 ** decimals);
+            quote.totalSourceCost = `${totalSrc} ${fromSymbol} + ${fixFeeEth.toFixed(6)} ${nativeSymbol} protocol fee`;
+          }
+          // Warn when protocol fee exceeds bridge amount
+          try {
+            const fixFeeBig = BigInt(fb.fixFeeNativeRaw);
+            const amountBig = BigInt(amountRaw);
+            // Only compare when both are in the same denomination (native token)
+            if (fromTokenAddress === "0x0000000000000000000000000000000000000000" ||
+                fromTokenAddress.toLowerCase() === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") {
+              if (fixFeeBig > amountBig) {
+                quote.feeWarning = `⚠️ Protocol fee (${fixFeeEth.toFixed(6)} ${nativeSymbol}) exceeds bridge amount (${params.amount} ${fromSymbol}). Consider bridging a larger amount.`;
+              }
+            }
+          } catch { /* ignore */ }
+        }
+
+        return quote;
       }
 
       const bestGasDisplay = formatGasFee(best);
@@ -366,28 +470,107 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
       }
 
       // Pre-flight balance warning: check if wallet has enough funds for the quote
-      if (params.fromAddress && !isCosmosChain(fromChainId)) {
+      // Solana balance check
+      if (params.fromAddress && isSolanaChain(fromChainId)) {
+        try {
+          const { Connection, PublicKey } = await import("@solana/web3.js");
+          const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+          const pubkey = new PublicKey(params.fromAddress);
+          const isNativeSOL = fromTokenAddress === "So11111111111111111111111111111111111111112";
+
+          let walletBalance: bigint;
+          let balanceFormatted: string;
+
+          if (isNativeSOL) {
+            const lamports = await connection.getBalance(pubkey);
+            walletBalance = BigInt(lamports);
+            balanceFormatted = (lamports / 1e9).toFixed(6);
+          } else {
+            // SPL token balance
+            const { TOKEN_PROGRAM_ID } = await import("@solana/spl-token") as any;
+            const tokenMint = new PublicKey(fromTokenAddress);
+            const accounts = await connection.getParsedTokenAccountsByOwner(pubkey, { mint: tokenMint });
+            const totalAmount = accounts.value.reduce((sum: bigint, acc: any) => {
+              return sum + BigInt(acc.account.data.parsed.info.tokenAmount.amount);
+            }, 0n);
+            walletBalance = totalAmount;
+            balanceFormatted = (Number(totalAmount) / 10 ** decimals).toFixed(decimals);
+          }
+
+          const amountRequired = BigInt(amountRaw);
+          if (walletBalance < amountRequired) {
+            response.balanceWarning = `Warning: wallet balance (${balanceFormatted} ${fromSymbol}) may be insufficient for ${params.amount} ${fromSymbol} quote`;
+          }
+        } catch {
+          // Balance check failure should never block the quote
+        }
+      }
+
+      // EVM balance check — validates BOTH token balance AND native balance for protocol fees
+      if (params.fromAddress && !isCosmosChain(fromChainId) && !isSolanaChain(fromChainId)) {
         try {
           const isNative =
             fromTokenAddress.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase() ||
             fromTokenAddress === "0x0000000000000000000000000000000000000000";
 
           const provider = await getProvider(fromChainId);
-          let walletBalance: bigint;
-          let balanceFormatted: string;
+
+          // Always check native balance (needed for gas + protocol fees even for ERC-20 bridges)
+          const nativeBalance = await provider.getBalance(params.fromAddress);
 
           if (isNative) {
-            walletBalance = await provider.getBalance(params.fromAddress);
-            balanceFormatted = ethers.formatEther(walletBalance);
-          } else {
-            const contract = new ethers.Contract(fromTokenAddress, ERC20_BALANCE_ABI, provider);
-            walletBalance = await contract.balanceOf(params.fromAddress);
-            balanceFormatted = ethers.formatUnits(walletBalance, decimals);
-          }
+            // For native token bridges: total cost = bridge amount + protocol fee + operating expenses
+            const bestFb = best.feeBreakdown as any;
+            const fixFee = bestFb?.fixFeeNativeRaw ? BigInt(bestFb.fixFeeNativeRaw) : 0n;
+            const totalSourceRaw = bestFb?.totalSourceAmountRaw ? BigInt(bestFb.totalSourceAmountRaw) : BigInt(amountRaw);
+            // Total needed = totalSourceAmount (amount + operating expenses) + fixFee
+            const totalNeeded = totalSourceRaw + fixFee;
 
-          const amountRequired = BigInt(amountRaw);
-          if (walletBalance < amountRequired) {
-            response.balanceWarning = `Warning: wallet balance (${balanceFormatted} ${fromSymbol}) may be insufficient for ${params.amount} ${fromSymbol} quote`;
+            const balanceFormatted = ethers.formatEther(nativeBalance);
+            const nativeSymbol = [56].includes(fromChainId) ? "BNB"
+              : [137].includes(fromChainId) ? "MATIC"
+              : [43114].includes(fromChainId) ? "AVAX"
+              : "ETH";
+
+            if (nativeBalance < totalNeeded) {
+              const totalNeededFormatted = ethers.formatEther(totalNeeded);
+              response.balanceWarning = `⚠️ Insufficient balance: wallet has ${balanceFormatted} ${nativeSymbol}, but this bridge requires ~${totalNeededFormatted} ${nativeSymbol} total (${params.amount} ${fromSymbol} bridge amount + protocol fees + operating expenses)`;
+            }
+          } else {
+            // For ERC-20 bridges: check token balance AND native balance for protocol fees + gas
+            const contract = new ethers.Contract(fromTokenAddress, ERC20_BALANCE_ABI, provider);
+            const tokenBalance: bigint = await contract.balanceOf(params.fromAddress);
+            const tokenFormatted = ethers.formatUnits(tokenBalance, decimals);
+
+            const amountRequired = BigInt(amountRaw);
+            const warnings: string[] = [];
+
+            if (tokenBalance < amountRequired) {
+              warnings.push(`Token balance (${tokenFormatted} ${fromSymbol}) is insufficient for ${params.amount} ${fromSymbol}`);
+            }
+
+            // Check native balance for protocol fee
+            const bestFb = best.feeBreakdown as any;
+            const fixFee = bestFb?.fixFeeNativeRaw ? BigInt(bestFb.fixFeeNativeRaw) : 0n;
+            if (fixFee > 0n) {
+              const nativeSymbol = [56].includes(fromChainId) ? "BNB"
+                : [137].includes(fromChainId) ? "MATIC"
+                : [43114].includes(fromChainId) ? "AVAX"
+                : "ETH";
+              // Need fixFee + some gas (estimate ~0.0002 ETH for L2s)
+              const gasBuffer = fromChainId === 1 ? 2000000000000000n : 200000000000000n; // 0.002 ETH L1 / 0.0002 ETH L2
+              const totalNativeNeeded = fixFee + gasBuffer;
+
+              if (nativeBalance < totalNativeNeeded) {
+                const nativeFormatted = ethers.formatEther(nativeBalance);
+                const feeFormatted = ethers.formatEther(fixFee);
+                warnings.push(`Native balance (${nativeFormatted} ${nativeSymbol}) may be insufficient for protocol fee (${feeFormatted} ${nativeSymbol}) + gas`);
+              }
+            }
+
+            if (warnings.length > 0) {
+              response.balanceWarning = `⚠️ ${warnings.join(". ")}`;
+            }
           }
         } catch {
           // Balance check failure should never block the quote

@@ -9,6 +9,8 @@ export interface ChainEntry {
 // but satisfy the routing engine's requirement for positive integer chain IDs.
 export const PERSISTENCE_CHAIN_ID = 9999001;
 export const COSMOSHUB_CHAIN_ID = 9999002;
+// Solana uses its real chain ID (as recognized by deBridge)
+export const SOLANA_CHAIN_ID = 7565164;
 
 const CHAINS: ChainEntry[] = [
   { id: 1, name: "Ethereum", key: "ethereum" },
@@ -82,6 +84,8 @@ const CHAINS: ChainEntry[] = [
   // Cosmos chains (synthetic IDs — mapped to real chain ID strings by Squid backend)
   { id: PERSISTENCE_CHAIN_ID, name: "Persistence", key: "persistence" },
   { id: COSMOSHUB_CHAIN_ID, name: "Cosmos Hub", key: "cosmoshub" },
+  // Solana (uses real chain ID as recognized by deBridge)
+  { id: SOLANA_CHAIN_ID, name: "Solana", key: "solana" },
 ];
 
 // Backend-specific chain ID overrides (reserved for future non-EVM chain support)
@@ -125,8 +129,20 @@ export function resolveChainId(input: string): number | null {
   if (lower === "cosmoshub4") {
     return COSMOSHUB_CHAIN_ID;
   }
+  // Solana aliases
+  if (lower === "sol" || lower === "solana") {
+    return SOLANA_CHAIN_ID;
+  }
   const match = CHAINS.find((c) => c.key === lower || c.name.toLowerCase() === lower);
   return match?.id ?? null;
+}
+
+/** Check if a chain key or ID refers to Solana */
+export function isSolanaChain(chainKeyOrId: string | number): boolean {
+  if (typeof chainKeyOrId === "number") {
+    return chainKeyOrId === SOLANA_CHAIN_ID;
+  }
+  return chainKeyOrId.toLowerCase() === "solana" || chainKeyOrId.toLowerCase() === "sol";
 }
 
 /** Check if a chain key or ID refers to a Cosmos chain */

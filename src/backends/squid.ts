@@ -30,6 +30,17 @@ const COSMOS_PLACEHOLDER_ADDRESS: Record<number, string> = {
 const BASE_URL = "https://v2.api.squidrouter.com";
 const TIMEOUT_MS = 15_000;
 
+/**
+ * Convert native token address from zero address to EVM sentinel address for Squid API.
+ * Squid rejects 0x0000...0000 and requires 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE for native tokens.
+ */
+function convertNativeTokenForSquid(tokenAddress: string): string {
+  if (tokenAddress === "0x0000000000000000000000000000000000000000") {
+    return "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+  }
+  return tokenAddress;
+}
+
 async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -137,8 +148,8 @@ export class SquidBackend implements BridgeBackend {
       const body: Record<string, any> = {
         fromChain: fromChainStr,
         toChain: toChainStr,
-        fromToken: params.fromTokenAddress,
-        toToken: params.toTokenAddress,
+        fromToken: convertNativeTokenForSquid(params.fromTokenAddress),
+        toToken: convertNativeTokenForSquid(params.toTokenAddress),
         fromAmount: params.amountRaw,
         fromAddress: params.fromAddress,
         toAddress: resolvedToAddress,
@@ -274,8 +285,8 @@ export class SquidBackend implements BridgeBackend {
       const body: Record<string, any> = {
         fromChain: this.resolveSquidChainId(p.fromChainId),
         toChain: this.resolveSquidChainId(p.toChainId),
-        fromToken: p.fromTokenAddress,
-        toToken: p.toTokenAddress,
+        fromToken: convertNativeTokenForSquid(p.fromTokenAddress),
+        toToken: convertNativeTokenForSquid(p.toTokenAddress),
         fromAmount: p.amountRaw,
         fromAddress: p.fromAddress,
         toAddress: p.toAddress,

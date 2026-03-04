@@ -44,11 +44,11 @@ const CHAIN_RPC_ENV_KEYS: Record<number, string> = {
 const DEFAULT_CHAIN_RPCS: Record<number, string[]> = {
   1: ["https://eth.drpc.org", "https://1rpc.io/eth", "https://ethereum-rpc.publicnode.com"],
   10: ["https://optimism.drpc.org", "https://1rpc.io/op", "https://optimism-rpc.publicnode.com"],
-  56: ["https://1rpc.io/bnb", "https://bsc.drpc.org", "https://bsc-rpc.publicnode.com", "https://bsc.meowrpc.com", "https://bsc-dataseed1.defibit.io"],
+  56: ["https://1rpc.io/bnb", "https://bsc.drpc.org", "https://bsc-rpc.publicnode.com", "https://bsc-dataseed1.defibit.io", "https://bsc-dataseed2.defibit.io"],
   137: ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"],
   42161: ["https://arbitrum.drpc.org", "https://1rpc.io/arb", "https://arbitrum-one-rpc.publicnode.com"],
   43114: ["https://avax.drpc.org", "https://1rpc.io/avax/c", "https://avalanche-c-chain-rpc.publicnode.com"],
-  8453: ["https://base.drpc.org", "https://1rpc.io/base", "https://gateway.tenderly.co/public/base", "https://base-rpc.publicnode.com", "https://base.meowrpc.com"],
+  8453: ["https://mainnet.base.org", "https://1rpc.io/base", "https://gateway.tenderly.co/public/base", "https://base-rpc.publicnode.com", "https://base.drpc.org"],
   59144: ["https://linea.drpc.org", "https://1rpc.io/linea", "https://linea-rpc.publicnode.com"],
   534352: ["https://scroll.drpc.org", "https://1rpc.io/scroll", "https://scroll-rpc.publicnode.com"],
   324: ["https://zksync.drpc.org", "https://1rpc.io/zksync2-era", "https://zksync-era-rpc.publicnode.com"],

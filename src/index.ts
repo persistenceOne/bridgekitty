@@ -21,6 +21,7 @@ import { registerHelpTool } from "./tools/help.js";
 import { registerXprtRewardsCheck } from "./tools/xprt-rewards.js";
 import { registerMultiQuote } from "./tools/multi-quote.js";
 import { registerOnboardTool } from "./tools/onboard.js";
+import { registerXprtStakingTools } from "./tools/xprt-staking.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -157,6 +158,7 @@ async function main() {
   registerGetTokens(server, engine);
   registerWalletTools(server);
   registerXprtFarmTools(server, engine);
+  registerXprtStakingTools(server);
   registerHelpTool(server);
   registerXprtRewardsCheck(server);
   registerMultiQuote(server, engine);

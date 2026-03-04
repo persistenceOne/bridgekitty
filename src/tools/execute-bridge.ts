@@ -3,7 +3,7 @@ import { ethers } from "ethers";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RoutingEngine } from "../routing/engine.js";
 import { simulateTransaction } from "../utils/tx-simulator.js";
-import { getChainName } from "../utils/chains.js";
+import { getChainName, isSolanaChain } from "../utils/chains.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 
 // H-3: Quote execution locking — prevent double-execution
@@ -46,7 +46,38 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
         .describe("Max slippage tolerance (0.005 = 0.5%). Applied by backends during quoting; reserved for future per-execution override."),
     },
     async (params) => {
-      const quote = engine.getCachedQuote(params.quoteId);
+      let quote = engine.getCachedQuote(params.quoteId);
+
+      // Auto-refresh expired quotes using the original parameters
+      if (!quote) {
+        const cached = engine.getCachedQuoteWithExpiry(params.quoteId);
+        if (cached?.expired && cached.quote.quoteData) {
+          try {
+            const qd = cached.quote.quoteData as any;
+            const p = qd?.params;
+            if (p) {
+              console.warn("[bridge_execute] Quote expired, auto-refreshing...");
+              const freshQuotes = await engine.getQuotes({
+                fromChainId: p.srcChainId,
+                toChainId: p.dstChainId,
+                fromTokenAddress: p.srcChainTokenIn,
+                toTokenAddress: p.dstChainTokenOut,
+                amountRaw: p.srcChainTokenInAmount,
+                fromAddress: p.fromAddress,
+                toAddress: p.toAddress,
+                providers: [cached.quote.backendName],
+                preference: "cheapest",
+              });
+              if (freshQuotes.length > 0) {
+                quote = freshQuotes[0];
+              }
+            }
+          } catch (err) {
+            console.error("[bridge_execute] Auto-refresh failed:", (err as Error).message);
+          }
+        }
+      }
+
       if (!quote) {
         return {
           content: [
@@ -136,6 +167,29 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
               "Approval is for the EXACT bridge amount only — not unlimited. " +
               "A new approval is needed for each bridge transaction.";
           }
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
+          };
+        }
+
+        // Solana transaction flow: return serialized tx for signing
+        if (txRequest.solanaTransaction) {
+          const response: Record<string, any> = {
+            provider: txRequest.provider,
+            trackingId: txRequest.trackingId,
+            slippage: params.slippage,
+            transaction: {
+              type: "solana",
+              serializedTx: txRequest.solanaTransaction.serializedTx,
+              chainId: txRequest.chainId,
+            },
+            instructions:
+              "This is a Solana transaction. Sign and send it using a Solana wallet. " +
+              "The serializedTx is hex-encoded (0x-prefixed) — decode with Buffer.from(data.slice(2), 'hex'), " +
+              "then deserialize as a VersionedTransaction. IMPORTANT: replace the recentBlockhash with a " +
+              "fresh one from getLatestBlockhash() before signing, as the embedded blockhash may be stale. " +
+              "After sending, use bridge_status with the trackingId to monitor progress.",
+          };
           return {
             content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
           };

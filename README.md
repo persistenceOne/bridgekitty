@@ -1,19 +1,39 @@
 # BridgeKitty 🐱
 
-Cross-chain bridge aggregator MCP server for AI agents. One server, 6 bridge backends, best routes across 100+ chains.
+Cross-chain bridge aggregator MCP server for AI agents. One server, 5 bridge backends, best routes across EVM, Solana, and Cosmos chains.
 
-BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, and safety checks.
+BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, balance checks, and safety warnings.
+
+## What's New in v0.2.0
+
+- **Solana support** — bidirectional bridging EVM ↔ Solana (native SOL delivery, not wrapped)
+- **Cosmos support** — EVM → Persistence/Cosmos Hub via Squid (Axelar)
+- **Protocol fee transparency** — deBridge fixFee, operating expenses, and total cost visible in every quote
+- **Balance warnings** — warns when wallet can't cover bridge amount + protocol fees + gas
+- **XPRT staking** — stake/unstake/claim rewards directly from the MCP server
+- **Farming multiplier** — tracks your staking tier (1x → 3x → 5x) from the rewards API
+- **Quote auto-refresh** — expired quotes automatically re-fetched on execute (60s expiry)
+- **ERC-20 approvals** — always generated for token bridges (Relay + deBridge)
+- **Bridge status tracking** — on-chain fallback when provider API hasn't indexed yet
 
 ## Supported Bridges
 
-| Backend | Type | Strength |
-|---------|------|----------|
-| **LI.FI** | Aggregator | Widest coverage (30+ bridges, any-to-any swap) |
-| **Skip** | Aggregator | 120+ chains including 62+ Cosmos/IBC chains |
-| **deBridge (DLN)** | Direct | Fast intent-based fills, low fees |
-| **Across** | Direct | Fastest fills (~6s), same-token bridging |
-| **Relay** | Direct | Gas-optimized, competitive routes |
-| **Persistence Interop** | Custom | BTC bridging (cbBTC/BTCB) + XPRT farming rewards |
+| Backend | Type | Chains | Strength |
+|---------|------|--------|----------|
+| **deBridge (DLN)** | Direct | EVM + Solana | Fast intent-based fills, Solana support |
+| **Relay** | Direct | EVM + Solana | No protocol fee, gas-optimized |
+| **LI.FI** | Aggregator | EVM | Widest coverage (30+ bridges, any-to-any swap) |
+| **Across** | Direct | EVM | Fastest fills (~6s), same-token bridging |
+| **Squid (Axelar)** | Aggregator | EVM + Cosmos | Only option for EVM → Cosmos routes |
+
+### Bridge Directions
+
+| Direction | Backends | Status |
+|-----------|----------|--------|
+| EVM → EVM | All 5 | ✅ Production |
+| EVM → Solana | deBridge, Relay | ✅ Production |
+| Solana → EVM | deBridge | ✅ Production |
+| EVM → Cosmos | Squid | ✅ Production |
 
 ## Quick Start
 
@@ -25,11 +45,7 @@ npx bridgekitty
 
 ### Claude Code
 
-Tell your agent:
-
-> Enable bridgekitty for swapping or bridging crypto across chains
-
-Or add to your MCP config (`~/.claude/claude_code_config.json`):
+Add to your MCP config (`~/.claude/claude_code_config.json`):
 
 ```json
 {
@@ -70,131 +86,102 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Local Development
+## Wallet Setup
 
-```bash
-git clone <repo-url>
-cd bridgekitty
-npm install
-npm run build
-npm start
-```
+BridgeKitty can manage wallets for autonomous bridging. Run `wallet_setup` to create wallets for EVM, Cosmos, and Solana — or provide your own addresses in quotes.
 
-## Environment Variables
+Wallet config is stored in `~/.bridgekitty/.env` (or the directory you run from). Keys never leave the local machine.
 
-All optional — BridgeKitty works with zero configuration.
+| Variable | Description |
+|----------|-------------|
+| `PRIVATE_KEY` | EVM private key (hex) |
+| `MNEMONIC` | BIP-39 mnemonic (derives EVM, Cosmos, Solana keys) |
+| `SOLANA_PRIVATE_KEY` | Solana private key (base58) |
+
+### Optional API Keys
 
 | Variable | Description |
 |----------|-------------|
 | `LIFI_API_KEY` | LI.FI API key (higher rate limits) |
-| `SKIP_API_KEY` | Skip Protocol API key (higher rate limits) |
+| `DEBRIDGE_API_KEY` | deBridge API key |
+| `SQUID_INTEGRATOR_ID` | Squid integrator ID |
 
 ## MCP Tools
 
 ### Core Bridge Tools
 
-#### `bridge_get_quote`
-
-Get competitive bridge quotes across all backends.
-
-```json
-{
-  "fromChain": "base",
-  "toChain": "arbitrum",
-  "fromToken": "USDC",
-  "toToken": "USDC",
-  "amount": "100",
-  "fromAddress": "0xYourAddress..."
-}
-```
-
-Returns ranked list of quotes with fees, estimated time, and a `quoteId` for execution.
-
-#### `bridge_execute`
-
-Build unsigned transaction(s) from a quote.
-
-```json
-{ "quoteId": "uuid-from-get-quote" }
-```
-
-Returns unsigned transaction data (to, data, value, chainId) + optional approval tx. The agent signs and sends via its wallet.
-
-#### `bridge_status`
-
-Check the status of a bridge transfer.
-
-```json
-{ "trackingId": "provider:tracking-id", "txHash": "0x..." }
-```
-
-#### `bridge_chains`
-
-List all supported chains with provider coverage.
-
-#### `bridge_tokens`
-
-Search for tokens on a specific chain.
-
-```json
-{ "chain": "base", "search": "USDC" }
-```
+| Tool | Description |
+|------|-------------|
+| `bridge_get_quote` | Get competitive quotes from all backends. Shows fees, time estimates, balance warnings. |
+| `bridge_execute` | Build transaction(s) from a quote. Handles approvals, auto-refreshes expired quotes. |
+| `bridge_status` | Track bridge progress. On-chain fallback when API hasn't indexed yet. |
+| `bridge_chains` | List supported chains with provider coverage. |
+| `bridge_tokens` | Search tokens on a chain. |
 
 ### Wallet Tools
 
-#### `wallet_setup`
+| Tool | Description |
+|------|-------------|
+| `wallet_setup` | Create wallets for EVM, Cosmos, Solana from a single mnemonic. |
+| `wallet_balance` | Check balances across all chains with USD prices (CoinGecko). |
 
-Create wallets for all supported chains (EVM, Cosmos, Solana). Derives from a single mnemonic. Credentials saved to `.env` in the working directory.
+### XPRT Staking & Farming
 
-#### `wallet_balance`
+| Tool | Description |
+|------|-------------|
+| `xprt_stake` | Stake XPRT to a validator (warns about 21-day unbonding). |
+| `xprt_unstake` | Unstake XPRT (21-day unbonding period). |
+| `xprt_claim_rewards` | Claim staking rewards. |
+| `xprt_rewards_check` | Check farming rewards, multiplier tier, epoch status. |
+| `xprt_farm_start` | Start automated BTC round-trip farming (cbBTC ↔ BTCB). |
+| `xprt_farm_boost` | Buy + stake XPRT for multiplier boost (1x → 3x → 5x). |
+| `bridgekitty_help` | Full docs on farming tiers, multipliers, and strategy. |
 
-Check wallet balances across chains.
+## Example: Bridge USDC from Base to Arbitrum
 
-### XPRT Farming Tools
+```
+Agent: "Bridge 100 USDC from Base to Arbitrum"
 
-Earn XPRT token rewards by bridging BTC variants (cbBTC on Base ↔ BTCB on BSC) through Persistence Interop.
-
-#### `xprt_farm_prepare`
-
-Convert ETH to cbBTC and bridge gas to BSC — sets up your wallet for farming.
-
-#### `xprt_farm_start`
-
-Start automated BTC round-trip swaps between Base and BSC. Configurable rounds, amounts, and risk limits.
-
-#### `xprt_farm_status`
-
-Check farming rewards status, wallet link, and current epoch info.
-
-#### `xprt_farm_boost`
-
-Buy and stake XPRT for reward multiplier boost (1x → 2x or 5x).
+→ bridge_get_quote: Gets quotes from deBridge, Relay, LI.FI, Across
+→ Shows: best rate, fees, estimated time, balance check
+→ bridge_execute: Builds approval tx + bridge tx
+→ Agent signs and sends both transactions
+→ bridge_status: Tracks until destination confirmed
+```
 
 ## Architecture
 
 ```
-Agent → MCP Tools → Routing Engine → [LI.FI, Skip, deBridge, Across, Relay, Persistence]
+Agent → MCP Tools → Routing Engine → [deBridge, Relay, LI.FI, Across, Squid]
                          ↓
-                   Quote Cache + Circuit Breaker
+                   Quote Cache (60s) + Circuit Breaker
                          ↓
                    Best Quote → buildTransaction → Unsigned TX
 ```
 
-- **Routing Engine:** Parallel quotes from all backends, ranked by cost/speed
+- **Routing Engine:** Parallel quotes from all backends, ranked by output amount
 - **Circuit Breaker:** Auto-skips failing backends, gradual recovery
 - **Token Registry:** 45+ verified tokens with canonical addresses per chain
-- **Transaction Simulator:** Dry-runs transactions before returning to agent
-- **Gas Estimator:** Chain-aware gas cost estimation with RPC failover
+- **Gas Estimator:** Chain-aware gas cost estimation with multi-RPC failover
+- **Balance Checker:** Validates token + native balance for fees before execution
+- **Fee Transparency:** Protocol fees (deBridge fixFee, operating expenses) surfaced in every quote
 
 ## Security
 
 - Exact-amount approvals only (never unlimited)
 - Transaction simulation before execution
-- Verified token registry prevents phishing via malicious contracts
-- No private keys in MCP flow — agents sign transactions externally
+- Verified token registry prevents address spoofing
+- No private keys in MCP protocol — agents sign transactions externally
 - Circuit breaker prevents cascading failures
 - Error messages sanitized (no key/path leakage)
-- `.env` file overwrite protection + permission checks
+- `.env` file permission checks + overwrite protection
+
+## Known Limitations
+
+- **Solana → EVM** returns a serialized transaction for external signing (no auto-execute)
+- **Relay status tracking** may show "unknown" for completed cross-chain bridges
+- **Solana SPL tokens** not yet shown in `wallet_balance` (only native SOL)
+- **Cosmos → EVM** bridging not yet supported (only EVM → Cosmos)
 
 ## License
 
