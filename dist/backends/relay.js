@@ -1,6 +1,6 @@
 import { formatTokenAmount } from "../utils/tokens.js";
-import { getAllChains } from "../utils/chains.js";
-import { buildApproveData, NATIVE_ADDRESS } from "../utils/evm.js";
+import { getAllChains, isSolanaChain } from "../utils/chains.js";
+import { buildApproveData, NATIVE_ADDRESS, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 const BASE_URL = "https://api.relay.link";
@@ -40,7 +40,10 @@ export class RelayBackend {
                     : params.fromTokenAddress,
                 destinationCurrency: params.toTokenAddress === NATIVE_ADDRESS
                     ? NATIVE_ADDRESS
-                    : params.toTokenAddress,
+                    // Relay uses native SOL address for actual SOL delivery (not wrapped SOL)
+                    : (isSolanaChain(params.toChainId) && params.toTokenAddress === "So11111111111111111111111111111111111111112")
+                        ? "11111111111111111111111111111111"
+                        : params.toTokenAddress,
                 amount: params.amountRaw,
                 tradeType: "EXACT_INPUT",
             };
@@ -96,7 +99,7 @@ export class RelayBackend {
                 // Relay quotes include step-level expiry. Use it if available, else 30s default.
                 expiresAt: data.steps?.[0]?.items?.[0]?.data?.expiresAt
                     ? new Date(data.steps[0].items[0].data.expiresAt).getTime()
-                    : Date.now() + 30_000,
+                    : Date.now() + 60_000,
             };
         }
         catch (err) {
@@ -136,6 +139,22 @@ export class RelayBackend {
             provider: "relay",
             trackingId: `relay:${data.requestId ?? Date.now()}`,
         };
+        // If Relay didn't include an approval step, generate one for ERC-20 tokens.
+        // Relay sometimes omits the approval step assuming the user already has allowance.
+        if (!approvalTx) {
+            const srcToken = data.details?.currencyIn?.currency?.address;
+            const inputAmount = data.details?.currencyIn?.amount;
+            if (srcToken && !isNativeToken(srcToken) && inputAmount && mainTx.to) {
+                // Generate an approval for the exact amount + 5% buffer to the Relay contract
+                const approvalAmount = (BigInt(inputAmount) * 105n / 100n).toString();
+                result.approvalTx = {
+                    to: srcToken,
+                    data: buildApproveData(mainTx.to, approvalAmount),
+                    value: "0x0",
+                    chainId: result.chainId,
+                };
+            }
+        }
         if (approvalTx) {
             // Validate: reject unlimited approvals from API (amount = MaxUint256)
             // ERC20 approve calldata: 0x095ea7b3 + spender(32 bytes) + amount(32 bytes)
@@ -177,12 +196,35 @@ export class RelayBackend {
                     elapsed: 0,
                 };
             }
-            // Prefer requestId (reliable), fall back to txHash query
-            // Use v3 endpoint (v2 is deprecated)
-            const queryParam = requestId
-                ? `requestId=${requestId}`
-                : `txHash=${txHash}`;
-            const data = await fetchJson(`${BASE_URL}/intents/status/v3?${queryParam}`);
+            // Prefer txHash (always available after submission), fall back to requestId
+            // The intents/status endpoint is unreliable for txHash lookups,
+            // so we also try the requests/v2 endpoint as a fallback.
+            let data;
+            if (txHash) {
+                // Try intents/status/v3 first
+                data = await fetchJson(`${BASE_URL}/intents/status/v3?txHash=${txHash}`);
+                // If status is unknown, try requests/v2 endpoint filtered by user
+                if (data?.status === "unknown") {
+                    try {
+                        const fromAddress = meta?.fromAddress;
+                        if (fromAddress) {
+                            const reqData = await fetchJson(`${BASE_URL}/requests/v2?user=${fromAddress}`);
+                            // Find the request matching our txHash
+                            const match = reqData?.requests?.find((r) => r.inTxHash === txHash || r.data?.inTxHashes?.includes(txHash));
+                            if (match) {
+                                data = { status: match.status };
+                            }
+                        }
+                    }
+                    catch { /* fallback failed, use original result */ }
+                }
+            }
+            else if (requestId) {
+                data = await fetchJson(`${BASE_URL}/intents/status/v3?requestId=${requestId}`);
+            }
+            else {
+                data = { status: "unknown" };
+            }
             // Relay v3 status values (from docs):
             //   waiting   — Waiting for deposit confirmation
             //   pending   — Deposit confirmed, pending destination chain submission

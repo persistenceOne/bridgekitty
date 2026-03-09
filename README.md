@@ -4,7 +4,15 @@ Cross-chain bridge aggregator MCP server for AI agents. One server, 5 bridge bac
 
 BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, balance checks, and safety warnings.
 
-## What's New in v0.2.0
+## What's New in v0.3.0
+
+- **`sign_and_send` parameter** — agents can now sign and broadcast transactions directly using locally-stored wallet keys
+- **Full EVM signing support** — works with all EVM backends (Across, Relay, LI.FI, Squid, deBridge) + Persistence Interop (EIP-712)
+- **Simulation fix** — ERC20 bridges now work on fresh wallets (previously blocked by premature simulation)
+- **Solana signing** — coming in next release
+
+<details>
+<summary>What's New in v0.2.0</summary>
 
 - **Solana support** — bidirectional bridging EVM ↔ Solana (native SOL delivery, not wrapped)
 - **Cosmos support** — EVM → Persistence/Cosmos Hub via Squid (Axelar)
@@ -15,6 +23,8 @@ BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the 
 - **Quote auto-refresh** — expired quotes automatically re-fetched on execute (60s expiry)
 - **ERC-20 approvals** — always generated for token bridges (Relay + deBridge)
 - **Bridge status tracking** — on-chain fallback when provider API hasn't indexed yet
+
+</details>
 
 ## Supported Bridges
 
@@ -98,6 +108,20 @@ Wallet config is stored in `~/.bridgekitty/.env` (or the directory you run from)
 | `MNEMONIC` | BIP-39 mnemonic (derives EVM, Cosmos, Solana keys) |
 | `SOLANA_PRIVATE_KEY` | Solana private key (base58) |
 
+## Transaction Signing
+
+By default, `bridge_execute` returns unsigned transactions for the agent or user to sign externally.
+
+Set `sign_and_send: true` to enable autonomous signing — BridgeKitty will use the wallet keys stored in `~/.bridgekitty/.env` to handle the full flow:
+
+1. **Approval** — sends ERC-20 approval transaction (if needed)
+2. **Re-build** — re-fetches the bridge transaction with updated nonce (if approval was sent)
+3. **Simulate** — runs `eth_estimateGas` pre-flight check
+4. **Sign** — signs the transaction with the local private key
+5. **Broadcast** — submits to the chain and returns the tx hash + explorer link
+
+**Persistence Interop** uses EIP-712 typed data signing (Permit2 approval + on-chain initiate) instead of standard approve-and-send.
+
 ### Optional API Keys
 
 | Variable | Description |
@@ -113,7 +137,7 @@ Wallet config is stored in `~/.bridgekitty/.env` (or the directory you run from)
 | Tool | Description |
 |------|-------------|
 | `bridge_get_quote` | Get competitive quotes from all backends. Shows fees, time estimates, balance warnings. |
-| `bridge_execute` | Build transaction(s) from a quote. Handles approvals, auto-refreshes expired quotes. |
+| `bridge_execute` | Build transaction(s) from a quote. Handles approvals, auto-refreshes expired quotes. Set `sign_and_send: true` to auto-sign and broadcast. |
 | `bridge_status` | Track bridge progress. On-chain fallback when API hasn't indexed yet. |
 | `bridge_chains` | List supported chains with provider coverage. |
 | `bridge_tokens` | Search tokens on a chain. |
@@ -139,6 +163,8 @@ Wallet config is stored in `~/.bridgekitty/.env` (or the directory you run from)
 
 ## Example: Bridge USDC from Base to Arbitrum
 
+### Default (unsigned transactions)
+
 ```
 Agent: "Bridge 100 USDC from Base to Arbitrum"
 
@@ -149,6 +175,18 @@ Agent: "Bridge 100 USDC from Base to Arbitrum"
 → bridge_status: Tracks until destination confirmed
 ```
 
+### With sign_and_send (autonomous signing)
+
+```
+Agent: "Bridge 100 USDC from Base to Arbitrum"
+
+→ bridge_get_quote: Gets quotes from all backends
+→ bridge_execute with sign_and_send: true
+  → Auto-signs approval tx + bridge tx using local wallet keys
+  → Returns tx hash + explorer link
+→ bridge_status: Tracks until destination confirmed
+```
+
 ## Architecture
 
 ```
@@ -156,7 +194,12 @@ Agent → MCP Tools → Routing Engine → [deBridge, Relay, LI.FI, Across, Squi
                          ↓
                    Quote Cache (60s) + Circuit Breaker
                          ↓
-                   Best Quote → buildTransaction → Unsigned TX
+                   Best Quote → buildTransaction
+                         ↓
+              ┌──────────┴──────────┐
+              ↓                     ↓
+        Unsigned TX          Signed + Broadcast
+         (default)            (sign_and_send)
 ```
 
 - **Routing Engine:** Parallel quotes from all backends, ranked by output amount
@@ -172,6 +215,7 @@ Agent → MCP Tools → Routing Engine → [deBridge, Relay, LI.FI, Across, Squi
 - Transaction simulation before execution
 - Verified token registry prevents address spoofing
 - No private keys in MCP protocol — agents sign transactions externally
+- `sign_and_send` uses locally-stored keys only (never transmitted over the network)
 - Circuit breaker prevents cascading failures
 - Error messages sanitized (no key/path leakage)
 - `.env` file permission checks + overwrite protection

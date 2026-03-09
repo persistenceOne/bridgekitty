@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { BackendValidationError } from "../backends/types.js";
 import { isValidEvmAddress } from "../utils/evm.js";
 import { CircuitBreaker } from "../utils/circuit-breaker.js";
-import { getAllChains, isCosmosChain } from "../utils/chains.js";
+import { getAllChains, isCosmosChain, isSolanaChain } from "../utils/chains.js";
 /** Minimum buffer (ms) before a quote's expiry — quotes expiring within this window are filtered out. */
 const EXPIRY_BUFFER_MS = 5_000;
 /** Timeout for each backend quote request (ms). */
@@ -36,30 +36,42 @@ function validateQuoteParams(params) {
     if (amountBig <= 0n) {
         throw new BackendValidationError(`Amount must be positive. Got: ${params.amountRaw}`);
     }
-    // Determine if source/destination are Cosmos chains (relaxed address validation)
+    // Determine if source/destination are non-EVM chains (relaxed address validation)
     const fromIsCosmos = isCosmosChain(params.fromChainId);
     const toIsCosmos = isCosmosChain(params.toChainId);
-    // fromAddress must be valid EVM address (unless destination is Cosmos-only route)
-    if (!fromIsCosmos && !isValidEvmAddress(params.fromAddress)) {
+    const fromIsSolana = isSolanaChain(params.fromChainId);
+    const toIsSolana = isSolanaChain(params.toChainId);
+    // Validate sender address based on source chain ecosystem
+    if (!fromIsCosmos && !fromIsSolana && !isValidEvmAddress(params.fromAddress)) {
         throw new BackendValidationError(`Invalid sender address: "${params.fromAddress}". Expected 0x followed by 40 hex characters.`);
     }
-    // toAddress, if provided, must be valid (relaxed for Cosmos bech32 addresses)
-    if (params.toAddress && !toIsCosmos && !isValidEvmAddress(params.toAddress)) {
-        throw new BackendValidationError(`Invalid recipient address: "${params.toAddress}". Expected 0x followed by 40 hex characters.`);
+    // Solana addresses are base58 encoded, 32-44 characters
+    if (fromIsSolana && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(params.fromAddress)) {
+        throw new BackendValidationError(`Invalid Solana sender address: "${params.fromAddress}". Expected base58-encoded address.`);
     }
-    // Token addresses: must look like EVM addresses (0x...) or Cosmos denoms (e.g. "uxprt", "uatom")
-    // Cosmos denoms are lowercase alphanumeric strings (no 0x prefix)
-    const isValidTokenAddress = (addr, chainIsCosmos) => {
+    // Validate recipient address based on destination chain ecosystem
+    if (params.toAddress) {
+        if (!toIsCosmos && !toIsSolana && !isValidEvmAddress(params.toAddress)) {
+            throw new BackendValidationError(`Invalid recipient address: "${params.toAddress}". Expected 0x followed by 40 hex characters.`);
+        }
+        if (toIsSolana && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(params.toAddress)) {
+            throw new BackendValidationError(`Invalid Solana recipient address: "${params.toAddress}". Expected base58-encoded address.`);
+        }
+    }
+    // Token addresses: must look like EVM addresses, Cosmos denoms, or Solana base58 mint addresses
+    const isValidTokenAddress = (addr, chainIsCosmos, chainIsSolana) => {
         if (isValidEvmAddress(addr))
             return true;
         if (chainIsCosmos && /^[a-z][a-z0-9/]{1,128}$/.test(addr))
             return true;
+        if (chainIsSolana && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr))
+            return true;
         return false;
     };
-    if (!isValidTokenAddress(params.fromTokenAddress, fromIsCosmos)) {
+    if (!isValidTokenAddress(params.fromTokenAddress, fromIsCosmos, fromIsSolana)) {
         throw new BackendValidationError(`Invalid source token address: "${params.fromTokenAddress}". Provide a valid 0x address or a recognized token symbol.`);
     }
-    if (!isValidTokenAddress(params.toTokenAddress, toIsCosmos)) {
+    if (!isValidTokenAddress(params.toTokenAddress, toIsCosmos, toIsSolana)) {
         throw new BackendValidationError(`Invalid destination token address: "${params.toTokenAddress}". Provide a valid 0x address or a recognized token symbol.`);
     }
 }
@@ -135,6 +147,18 @@ export class RoutingEngine {
             for (const b of this.backends) {
                 if (!allowed.has(b.name.toLowerCase())) {
                     this.lastFailedProviders.push({ provider: b.name, reason: "filtered out by providers parameter" });
+                }
+            }
+        }
+        // Filter out backends that don't support Solana chains
+        const involvesSolana = isSolanaChain(params.fromChainId) || isSolanaChain(params.toChainId);
+        if (involvesSolana) {
+            const solanaCapable = new Set(["debridge"]); // Only deBridge supports Solana
+            const preFilter = eligibleBackends;
+            eligibleBackends = eligibleBackends.filter((b) => solanaCapable.has(b.name.toLowerCase()));
+            for (const b of preFilter) {
+                if (!solanaCapable.has(b.name.toLowerCase())) {
+                    this.lastFailedProviders.push({ provider: b.name, reason: "chain not supported (Solana)" });
                 }
             }
         }
@@ -262,6 +286,16 @@ export class RoutingEngine {
             return null;
         }
         return entry.quote;
+    }
+    /**
+     * Get a cached quote even if it's expired. Returns { quote, expired } so callers
+     * can decide to auto-refresh. Does NOT delete expired entries.
+     */
+    getCachedQuoteWithExpiry(quoteId) {
+        const entry = this.quoteCache.get(quoteId);
+        if (!entry)
+            return null;
+        return { quote: entry.quote, expired: entry.expiresAt < Date.now() };
     }
     getBackend(name) {
         return this.backends.find((b) => b.name === name);

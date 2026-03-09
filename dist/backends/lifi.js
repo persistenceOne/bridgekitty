@@ -157,7 +157,7 @@ export class LiFiBackend {
                     route: `${fromSymbol} → ${toolNames} → ${toSymbol}`,
                     quoteData: route,
                     // LI.FI quotes are volatile (DEX prices shift rapidly) — use 30s expiry
-                    expiresAt: Date.now() + 30_000,
+                    expiresAt: Date.now() + 60_000,
                 };
             });
         }
