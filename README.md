@@ -50,7 +50,7 @@ BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the 
 ### npx (zero install)
 
 ```bash
-npx bridgekitty
+npx @persistenceone/bridgekitty
 ```
 
 ### Claude Code
@@ -62,7 +62,7 @@ Add to your MCP config (`~/.claude/claude_code_config.json`):
   "mcpServers": {
     "bridgekitty": {
       "command": "npx",
-      "args": ["bridgekitty"]
+      "args": ["@persistenceone/bridgekitty"]
     }
   }
 }
@@ -76,7 +76,7 @@ Add to Cursor's MCP settings (Settings > MCP Servers):
 {
   "bridgekitty": {
     "command": "npx",
-    "args": ["bridgekitty"]
+    "args": ["@persistenceone/bridgekitty"]
   }
 }
 ```
@@ -90,7 +90,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "bridgekitty": {
       "command": "npx",
-      "args": ["bridgekitty"]
+      "args": ["@persistenceone/bridgekitty"]
     }
   }
 }
