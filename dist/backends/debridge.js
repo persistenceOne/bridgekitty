@@ -1,5 +1,5 @@
 import { formatTokenAmount } from "../utils/tokens.js";
-import { getBackendChainId, getAllChains } from "../utils/chains.js";
+import { getBackendChainId, getAllChains, isSolanaChain } from "../utils/chains.js";
 import { buildApproveData, isNativeToken } from "../utils/evm.js";
 import { estimateGasCostUsd, getGasUnits } from "../utils/gas-estimator.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
@@ -35,10 +35,26 @@ export class DeBridgeBackend {
             const srcChainId = getBackendChainId("debridge", params.fromChainId);
             const dstChainId = getBackendChainId("debridge", params.toChainId);
             url.searchParams.set("srcChainId", String(srcChainId));
-            url.searchParams.set("srcChainTokenIn", params.fromTokenAddress);
+            // deBridge uses 0x000...0 for native EVM tokens (not 0xEeee...); convert.
+            const srcToken = isNativeToken(params.fromTokenAddress)
+                ? "0x0000000000000000000000000000000000000000"
+                : params.fromTokenAddress;
+            url.searchParams.set("srcChainTokenIn", srcToken);
             url.searchParams.set("srcChainTokenInAmount", params.amountRaw);
             url.searchParams.set("dstChainId", String(dstChainId));
-            url.searchParams.set("dstChainTokenOut", params.toTokenAddress);
+            // deBridge uses native SOL address (system program) instead of wrapped SOL mint.
+            // Using the native address ensures the solver delivers actual SOL, not wSOL.
+            const WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112";
+            const NATIVE_SOL_ADDRESS = "11111111111111111111111111111111";
+            let dstToken = params.toTokenAddress;
+            if (isSolanaChain(params.toChainId) && params.toTokenAddress === WRAPPED_SOL_MINT) {
+                dstToken = NATIVE_SOL_ADDRESS;
+            }
+            else if (!isSolanaChain(params.toChainId) && isNativeToken(params.toTokenAddress)) {
+                // deBridge uses 0x000...0 for native EVM tokens on destination too
+                dstToken = "0x0000000000000000000000000000000000000000";
+            }
+            url.searchParams.set("dstChainTokenOut", dstToken);
             url.searchParams.set("prependOperatingExpenses", "true");
             if (this.affiliateFeePercent && this.affiliateFeeRecipient) {
                 url.searchParams.set("affiliateFeePercent", this.affiliateFeePercent);
@@ -97,6 +113,12 @@ export class DeBridgeBackend {
                     minOutputRaw = dstAmount;
                 }
             }
+            // Extract fixFee (flat protocol fee in native token, e.g. 0.001 ETH)
+            // This is added to tx.value on top of the bridge amount — critical for balance checks
+            const fixFee = data.fixFee ? String(data.fixFee) : "0";
+            const operatingExpense = data.estimation.srcChainTokenIn?.approximateOperatingExpense ?? "0";
+            // Total amount the user actually needs (input + operating expenses + fixFee for native)
+            const totalSourceAmount = data.estimation.srcChainTokenIn?.amount ?? params.amountRaw;
             return {
                 backendName: "debridge",
                 provider: "deBridge (direct)",
@@ -114,17 +136,22 @@ export class DeBridgeBackend {
                     integratorFeeUsd: 0,
                     integratorFeePercent: null,
                     totalFeeUsd: gasCostUsd !== null ? totalFeeUsd + gasCostUsd : null,
+                    // deBridge-specific: flat fee in native token (e.g. 0.001 ETH on Base)
+                    fixFeeNativeRaw: fixFee,
+                    operatingExpenseRaw: operatingExpense,
+                    totalSourceAmountRaw: totalSourceAmount,
                 },
                 estimatedTimeSeconds: data.estimation.estimatedFulfillmentDelay ?? 30,
                 route: `${srcTokenSymbol} → deBridge DLN → ${dstTokenSymbol}`,
                 quoteData: {
                     estimation: data.estimation,
                     order: data.order,
+                    fixFee,
                     params: {
                         srcChainId: params.fromChainId,
                         dstChainId: params.toChainId,
                         srcChainTokenIn: params.fromTokenAddress,
-                        dstChainTokenOut: params.toTokenAddress,
+                        dstChainTokenOut: dstToken,
                         srcChainTokenInAmount: params.amountRaw,
                         fromAddress: params.fromAddress,
                         toAddress: params.toAddress || params.fromAddress,
@@ -133,7 +160,7 @@ export class DeBridgeBackend {
                 // deBridge DLN quotes: use estimation expiry if available, else conservative 30s
                 expiresAt: data.estimation?.expiration
                     ? new Date(data.estimation.expiration).getTime()
-                    : Date.now() + 30_000,
+                    : Date.now() + 60_000,
             };
         }
         catch (err) {
@@ -181,11 +208,34 @@ export class DeBridgeBackend {
                 throw err;
             }
         }
+        const orderId = data.orderId ?? `${Date.now()}`;
+        // Handle Solana source chains — deBridge returns serialized Solana transaction
+        if (isSolanaChain(p.srcChainId)) {
+            // For Solana, deBridge returns data.tx.data as a hex-encoded (0x-prefixed) serialized
+            // VersionedTransaction. Caller must decode hex, replace recentBlockhash, sign, and send.
+            const serializedTx = data.tx.data || data.tx.serializedTx;
+            if (!serializedTx) {
+                throw new Error("Invalid Solana transaction data in deBridge create-tx response. " +
+                    "Expected serialized transaction in tx.data.");
+            }
+            return {
+                // Use placeholder values for EVM-specific fields (not used for Solana)
+                to: "solana",
+                data: "0x",
+                value: "0x0",
+                chainId: p.srcChainId,
+                provider: "debridge",
+                trackingId: `debridge:${orderId}`,
+                solanaTransaction: {
+                    serializedTx,
+                },
+            };
+        }
+        // EVM source chain handling
         if (!data.tx || !data.tx.to || !data.tx.data) {
             throw new Error("Invalid or missing transaction data in deBridge create-tx response. " +
                 "Ensure senderAddress is provided.");
         }
-        const orderId = data.orderId ?? `${Date.now()}`;
         const result = {
             to: data.tx.to,
             data: data.tx.data,
@@ -213,6 +263,10 @@ export class DeBridgeBackend {
                 value: "0x0",
                 chainId: p.srcChainId,
             };
+            // deBridge's create-tx embeds the nonce from when it was called.
+            // After approval is sent, the nonce becomes stale.
+            // Caller must re-fetch the bridge tx after approval confirms.
+            result.needsPostApprovalBuild = true;
         }
         return result;
     }
@@ -241,9 +295,44 @@ export class DeBridgeBackend {
             };
         }
         catch (err) {
+            // Fallback: check on-chain tx receipt if we have a txHash
+            if (meta?.txHash && meta?.fromChain) {
+                try {
+                    const { getProvider } = await import("../utils/gas-estimator.js");
+                    const chainId = Number(meta.fromChain);
+                    if (!isNaN(chainId) && !isSolanaChain(chainId)) {
+                        const provider = await getProvider(chainId);
+                        const receipt = await provider.getTransactionReceipt(meta.txHash);
+                        if (receipt) {
+                            const confirmed = receipt.status === 1;
+                            return {
+                                state: confirmed ? "pending" : "failed",
+                                humanReadable: confirmed
+                                    ? `Transaction confirmed on-chain (block ${receipt.blockNumber}). Bridge provider hasn't indexed the order yet — this is normal, check again in 1-2 minutes.`
+                                    : `Transaction reverted on-chain (block ${receipt.blockNumber}). The bridge transaction failed.`,
+                                sourceTxHash: meta.txHash,
+                                provider: "debridge",
+                                elapsed: 0,
+                            };
+                        }
+                        else {
+                            return {
+                                state: "pending",
+                                humanReadable: "Transaction submitted but not yet confirmed on-chain. Wait for block confirmation.",
+                                sourceTxHash: meta.txHash,
+                                provider: "debridge",
+                                elapsed: 0,
+                            };
+                        }
+                    }
+                }
+                catch {
+                    // On-chain check failed too — fall through to unknown
+                }
+            }
             return {
                 state: "unknown",
-                humanReadable: `Status check failed: ${sanitizeError(err)}`,
+                humanReadable: `Status check failed: ${sanitizeError(err)}. If you just submitted the transaction, wait 1-2 minutes for the bridge provider to index it.`,
                 provider: "debridge",
                 elapsed: 0,
             };

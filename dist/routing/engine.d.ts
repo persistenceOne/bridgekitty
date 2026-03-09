@@ -19,6 +19,14 @@ export declare class RoutingEngine {
     constructor(backends: BridgeBackend[], circuitBreaker?: CircuitBreaker);
     getQuotes(params: QuoteParams): Promise<CachedQuote[]>;
     getCachedQuote(quoteId: string): BridgeQuote | null;
+    /**
+     * Get a cached quote even if it's expired. Returns { quote, expired } so callers
+     * can decide to auto-refresh. Does NOT delete expired entries.
+     */
+    getCachedQuoteWithExpiry(quoteId: string): {
+        quote: BridgeQuote;
+        expired: boolean;
+    } | null;
     getBackend(name: string): BridgeBackend | undefined;
     getAllBackends(): BridgeBackend[];
     /**
