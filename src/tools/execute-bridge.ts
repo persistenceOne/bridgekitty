@@ -195,37 +195,42 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
           };
         }
 
-        // Simulate the main transaction to verify it won't revert
+        // Simulate the main transaction to verify it won't revert.
+        // Skip simulation when an approval tx is pending — the main tx would
+        // naturally revert with "transfer amount exceeds allowance" until the
+        // user has sent the approval on-chain.
         const warnings: string[] = [];
-        const simulation = await simulateTransaction(txRequest.chainId, {
-          to: txRequest.to,
-          data: txRequest.data,
-          value: txRequest.value,
-        });
+        if (!txRequest.approvalTx) {
+          const simulation = await simulateTransaction(txRequest.chainId, {
+            to: txRequest.to,
+            data: txRequest.data,
+            value: txRequest.value,
+          });
 
-        if (!simulation.success) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({
-                  error: "Transaction simulation failed",
-                  message: simulation.error,
-                  advice: "The transaction would likely revert on-chain. Please get a fresh quote and try again.",
-                  provider: txRequest.provider,
-                }, null, 2),
-              },
-            ],
-            isError: true,
-          };
-        }
+          if (!simulation.success) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    error: "Transaction simulation failed",
+                    message: simulation.error,
+                    advice: "The transaction would likely revert on-chain. Please get a fresh quote and try again.",
+                    provider: txRequest.provider,
+                  }, null, 2),
+                },
+              ],
+              isError: true,
+            };
+          }
 
-        if (simulation.warning) {
-          warnings.push(simulation.warning);
-        }
+          if (simulation.warning) {
+            warnings.push(simulation.warning);
+          }
 
-        if (simulation.estimatedGas) {
-          txRequest.gasLimit = txRequest.gasLimit ?? simulation.estimatedGas;
+          if (simulation.estimatedGas) {
+            txRequest.gasLimit = txRequest.gasLimit ?? simulation.estimatedGas;
+          }
         }
 
         const response: Record<string, any> = {
