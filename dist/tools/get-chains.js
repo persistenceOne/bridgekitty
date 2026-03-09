@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isCosmosChain } from "../utils/chains.js";
+import { isCosmosChain, isSolanaChain } from "../utils/chains.js";
 // Well-known chain ID → canonical name/key (for resolving unnamed "Chain XXXX" entries
 // and for picking the best name/key when merging duplicate entries from different providers)
 const CHAIN_ID_NAMES = {
@@ -132,8 +132,7 @@ export function registerGetChains(server, engine) {
         const solanaKeys = new Set(["solana"]);
         const evmChains = chains.filter((c) => !cosmosKeys.has(c.key) && !solanaKeys.has(c.key) && !isCosmosChain(c.id));
         const cosmos = chains.filter((c) => cosmosKeys.has(c.key) || isCosmosChain(c.id));
-        // Solana routing is not supported in v1 — filter out any stray Solana entries from backend APIs
-        const solana = [];
+        const solana = chains.filter((c) => solanaKeys.has(c.key) || isSolanaChain(c.id));
         const formatChain = (c) => ({ id: c.id, name: c.name, key: c.key, providers: c.providers });
         return {
             content: [

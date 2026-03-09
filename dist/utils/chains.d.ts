@@ -5,10 +5,13 @@ export interface ChainEntry {
 }
 export declare const PERSISTENCE_CHAIN_ID = 9999001;
 export declare const COSMOSHUB_CHAIN_ID = 9999002;
+export declare const SOLANA_CHAIN_ID = 7565164;
 export declare function getBackendChainId(backendName: string, chainId: number): number;
 export declare const COSMOS_CHAIN_IDS: Record<string, string>;
 export declare const SYNTHETIC_TO_COSMOS: Record<number, string>;
 export declare function resolveChainId(input: string): number | null;
+/** Check if a chain key or ID refers to Solana */
+export declare function isSolanaChain(chainKeyOrId: string | number): boolean;
 /** Check if a chain key or ID refers to a Cosmos chain */
 export declare function isCosmosChain(chainKeyOrId: string | number): boolean;
 /** Get the Cosmos chain ID string for Squid Router from a synthetic numeric ID */

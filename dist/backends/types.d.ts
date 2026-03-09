@@ -26,6 +26,9 @@ export interface FeeBreakdown {
     integratorFeeUsd: number;
     integratorFeePercent: string | null;
     totalFeeUsd: number | null;
+    fixFeeNativeRaw?: string;
+    operatingExpenseRaw?: string;
+    totalSourceAmountRaw?: string;
 }
 export interface BridgeQuote {
     /** Machine-readable backend name (e.g. "lifi", "debridge") for routing/lookup */
@@ -76,6 +79,14 @@ export interface TransactionRequest {
         types: Record<string, unknown>;
         value: Record<string, unknown>;
         description: string;
+    };
+    /**
+     * Solana transaction data. When present, the source chain is Solana and the agent
+     * must sign/send this as a Solana transaction (not EVM).
+     * `serializedTx` is a base58-encoded versioned transaction.
+     */
+    solanaTransaction?: {
+        serializedTx: string;
     };
 }
 export interface BridgeStatus {
