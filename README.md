@@ -4,6 +4,10 @@ Cross-chain bridge aggregator MCP server for AI agents. One server, 5 bridge bac
 
 BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, balance checks, and safety warnings.
 
+<a href="https://glama.ai/mcp/servers/persistenceOne/persistenceone-bridgekitty">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/persistenceOne/persistenceone-bridgekitty/badge" alt="persistenceone-bridgekitty MCP server" />
+</a>
+
 ## What's New in v0.3.0
 
 - **`sign_and_send` parameter** — agents can now sign and broadcast transactions directly using locally-stored wallet keys
