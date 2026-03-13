@@ -238,12 +238,14 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
           const connectedSigner = signer.connect(provider);
 
           // Handle approval tx if present
+          let approvalNonce: number | undefined;
           if (txRequest.approvalTx) {
             const approvalResponse = await connectedSigner.sendTransaction({
               to: txRequest.approvalTx.to,
               data: txRequest.approvalTx.data,
               value: txRequest.approvalTx.value,
             });
+            approvalNonce = approvalResponse.nonce;
             await approvalResponse.wait();
 
             // If backend needs post-approval rebuild, re-fetch the main tx
@@ -282,11 +284,18 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
             };
           }
 
+          // Use approval nonce + 1 when available to avoid stale RPC reads on L2s,
+          // otherwise fetch from network with "pending" to include mempool txs
+          const nonce = approvalNonce !== undefined
+            ? approvalNonce + 1
+            : await provider.getTransactionCount(connectedSigner.address, "pending");
+
           // Send the main transaction
           const txResponse = await connectedSigner.sendTransaction({
             to: txRequest.to,
             data: txRequest.data,
             value: txRequest.value,
+            nonce,
             ...(txRequest.gasLimit ? { gasLimit: txRequest.gasLimit } : {}),
             ...(sim.estimatedGas ? { gasLimit: sim.estimatedGas } : {}),
           });
