@@ -1,6 +1,6 @@
 {
   "name": "@persistenceone/bridgekitty",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "BridgeKitty 🐱 — Cross-chain bridge aggregator MCP server for AI agents. One tool, all bridges, best routes.",
   "type": "module",
   "main": "dist/index.js",
