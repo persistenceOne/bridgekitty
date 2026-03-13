@@ -35,10 +35,11 @@ function validateQuoteParams(params: QuoteParams): void {
     );
   }
 
-  // Cannot bridge to same chain
-  if (params.fromChainId === params.toChainId) {
+  // Same-chain: tokens must differ (otherwise it's a no-op)
+  if (params.fromChainId === params.toChainId &&
+      params.fromTokenAddress.toLowerCase() === params.toTokenAddress.toLowerCase()) {
     throw new BackendValidationError(
-      `Source and destination chains are the same (${params.fromChainId}). Use a DEX for same-chain swaps.`
+      `Source and destination tokens are the same on chain ${params.fromChainId}. Nothing to swap.`
     );
   }
 
@@ -203,6 +204,18 @@ export class RoutingEngine {
       for (const b of this.backends) {
         if (!allowed.has(b.name.toLowerCase())) {
           this.lastFailedProviders.push({ provider: b.name, reason: "filtered out by providers parameter" });
+        }
+      }
+    }
+
+    // Same-chain swaps: only DEX-capable backends (LI.FI routes through DEX aggregators)
+    if (params.fromChainId === params.toChainId) {
+      const dexCapable = new Set(["lifi"]);
+      const preFilter = eligibleBackends;
+      eligibleBackends = eligibleBackends.filter((b) => dexCapable.has(b.name.toLowerCase()));
+      for (const b of preFilter) {
+        if (!dexCapable.has(b.name.toLowerCase())) {
+          this.lastFailedProviders.push({ provider: b.name, reason: "same-chain swaps not supported (bridge-only provider)" });
         }
       }
     }
