@@ -448,7 +448,6 @@ export function registerGetQuote(server, engine) {
                 }
                 else {
                     // SPL token balance
-                    const { TOKEN_PROGRAM_ID } = await import("@solana/spl-token");
                     const tokenMint = new PublicKey(fromTokenAddress);
                     const accounts = await connection.getParsedTokenAccountsByOwner(pubkey, { mint: tokenMint });
                     const totalAmount = accounts.value.reduce((sum, acc) => {
