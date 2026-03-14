@@ -1,6 +1,9 @@
 import { formatTokenAmount } from "../utils/tokens.js";
 import { buildApproveData } from "../utils/evm.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
+import { ethers } from "ethers";
+const LIFI_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BASE_URL = "https://li.quest/v1";
 const TIMEOUT_MS = 30_000;
 async function fetchJson(url, init) {
@@ -44,14 +47,21 @@ export class LiFiBackend {
      */
     async getQuotes(params) {
         try {
+            // LI.FI requires EIP-55 checksummed addresses and uses 0xEeee... for native tokens
+            const fromToken = params.fromTokenAddress.toLowerCase() === ZERO_ADDRESS
+                ? LIFI_NATIVE_TOKEN : params.fromTokenAddress;
+            const toToken = params.toTokenAddress.toLowerCase() === ZERO_ADDRESS
+                ? LIFI_NATIVE_TOKEN : params.toTokenAddress;
+            const checksumFrom = ethers.getAddress(params.fromAddress.toLowerCase());
+            const checksumTo = params.toAddress ? ethers.getAddress(params.toAddress.toLowerCase()) : checksumFrom;
             const body = {
                 fromChainId: params.fromChainId,
                 toChainId: params.toChainId,
-                fromTokenAddress: params.fromTokenAddress,
-                toTokenAddress: params.toTokenAddress,
+                fromTokenAddress: fromToken,
+                toTokenAddress: toToken,
                 fromAmount: params.amountRaw,
-                fromAddress: params.fromAddress,
-                toAddress: params.toAddress || params.fromAddress,
+                fromAddress: checksumFrom,
+                toAddress: checksumTo,
                 options: {
                     order: params.preference === "fastest" ? "FASTEST" : "CHEAPEST",
                     slippage: 0.03,
