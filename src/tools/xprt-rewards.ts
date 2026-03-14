@@ -72,14 +72,12 @@ export function registerXprtRewardsCheck(server: McpServer) {
         result.totalXprtEarned = rewardData.totalXprtEarned ?? "not_yet_tracked";
         result.pendingXprtRewards = rewardData.pendingXprtRewards ?? "pending_epoch_close";
         result.nextDistributionDate = rewardData.nextDistributionDate ?? "pending_epoch_close";
-        result.currentMultiplier = rewardData.currentMultiplier ?? "not_yet_determined";
         result.qualifyingVolumeBtc = rewardData.qualifyingVolumeBtc ?? "no_qualifying_volume";
         result.lifetimeVolumeBtc = rewardData.lifetimeVolumeBtc ?? "no_volume_recorded";
       } catch {
         result.totalXprtEarned = "not_yet_tracked";
         result.pendingXprtRewards = "pending_epoch_close";
         result.nextDistributionDate = "pending_epoch_close";
-        result.currentMultiplier = "not_yet_determined";
         result.qualifyingVolumeBtc = "no_qualifying_volume";
         result.lifetimeVolumeBtc = "no_volume_recorded";
       }
@@ -139,43 +137,68 @@ export function registerXprtRewardsCheck(server: McpServer) {
         result.persistenceAddressLinked = "unknown";
       }
 
-      // Try to fetch staking data if mnemonic is available to enhance currentMultiplier
-      const mnemonic = getKey("mnemonic");
-      if (mnemonic && (result.currentMultiplier === "not_yet_determined" || result.currentMultiplier === "unknown")) {
-        try {
-          const { Secp256k1HdWallet } = await import("@cosmjs/amino");
-          const wallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
-          const [account] = await wallet.getAccounts();
-          const persistenceAddress = account.address;
+      // Fetch multiplier and staking info from leaderboard API (authoritative source)
+      try {
+        const epochNumber = result.currentEpoch?.epochNumber;
+        if (epochNumber && epochNumber !== "not_available" && epochNumber !== "api_unavailable") {
+          const leaderboardData = await fetchJson(`${REWARDS_API}/leaderboard?epoch=${epochNumber}`);
+          const entries = Array.isArray(leaderboardData) ? leaderboardData : leaderboardData.data ?? leaderboardData.leaderboard ?? [];
+          const entry = entries.find((e: any) =>
+            e.walletAddress?.toLowerCase() === evmAddress!.toLowerCase() ||
+            e.evmAddress?.toLowerCase() === evmAddress!.toLowerCase() ||
+            e.address?.toLowerCase() === evmAddress!.toLowerCase()
+          );
 
-          // Fetch staking delegations
-          const delegationsData = await fetchJson(`${PERSISTENCE_REST}/cosmos/staking/v1beta1/delegations/${persistenceAddress}`);
+          if (entry) {
+            result.currentMultiplier = entry.rewardMultiplier ? `${entry.rewardMultiplier}x` : entry.multiplier ?? "1x";
+            result.rank = entry.rank ?? null;
+            result.tier = entry.tier ?? null;
+            result.bridgedVolumeUsd = entry.bridgedVolumeUsd ?? entry.volumeUsd ?? null;
+            result.rewardPoints = entry.rewardPoints ?? entry.points ?? null;
+            result.txCount = entry.txCount ?? entry.transactionCount ?? null;
+            result.estimatedRewardXprt = entry.estimatedReward ?? entry.estimatedRewardXprt ?? null;
 
-          let totalStaked = 0;
-          if (delegationsData.delegation_responses) {
-            for (const del of delegationsData.delegation_responses) {
-              totalStaked += parseInt(del.balance?.amount || "0");
-            }
-          }
-
-          const stakedXprt = totalStaked / 1e6;
-
-          // Determine multiplier tier from staked amount
-          if (stakedXprt >= 1000000) {
-            result.currentMultiplier = "5x";
-          } else if (stakedXprt >= 10000) {
-            result.currentMultiplier = "2x";
+            result.stakingInfo = {
+              stakedXprt: entry.xprtStaked ?? entry.stakedXprt ?? "unknown",
+              isStaker: entry.isStaker ?? null,
+              multiplierFromLeaderboard: result.currentMultiplier,
+              note: "Multiplier sourced from leaderboard API"
+            };
           } else {
             result.currentMultiplier = "1x";
+            result.stakingInfo = { note: "Wallet not found in current epoch leaderboard" };
           }
+        } else {
+          result.currentMultiplier = "not_yet_determined";
+        }
+      } catch {
+        // Fallback: try staking data directly
+        const mnemonic = getKey("mnemonic");
+        if (mnemonic) {
+          try {
+            const { Secp256k1HdWallet } = await import("@cosmjs/amino");
+            const wallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "persistence" });
+            const [account] = await wallet.getAccounts();
+            const persistenceAddress = account.address;
+            const delegationsData = await fetchJson(`${PERSISTENCE_REST}/cosmos/staking/v1beta1/delegations/${persistenceAddress}`);
 
-          result.stakingInfo = {
-            stakedXprt: stakedXprt.toFixed(2),
-            multiplierFromStaking: result.currentMultiplier,
-            note: "Multiplier determined from current staking position"
-          };
-        } catch {
-          // If staking data fetch fails, keep the original value
+            let totalStaked = 0;
+            if (delegationsData.delegation_responses) {
+              for (const del of delegationsData.delegation_responses) {
+                totalStaked += parseInt(del.balance?.amount || "0");
+              }
+            }
+
+            result.stakingInfo = {
+              stakedXprt: (totalStaked / 1e6).toFixed(2),
+              note: "Multiplier unavailable — leaderboard API failed. Staking data from chain."
+            };
+            result.currentMultiplier = "unknown (leaderboard unavailable)";
+          } catch {
+            result.currentMultiplier = "unknown";
+          }
+        } else {
+          result.currentMultiplier = "unknown";
         }
       }
 
