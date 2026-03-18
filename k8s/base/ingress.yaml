@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bridgekitty-backend-ingress
+  labels:
+    app: bridgekitty-backend
+  annotations:
+    # NGINX ingress controller annotations
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    # Enable CORS for browser-based MCP clients
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-max-age: "86400"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - bridgekitty.persistence.one
+      secretName: bridgekitty-tls
+  rules:
+    - host: bridgekitty.persistence.one
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bridgekitty-backend
+                port:
+                  number: 80
+---
+# NOTE: TLS certificate can be provisioned automatically with cert-manager:
+# 1. Install cert-manager in your cluster
+# 2. Create a Certificate resource or add these annotations:
+#    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+#    cert-manager.io/acme-challenge-type: "http01"
+#
+# Or manually create the TLS secret:
+# kubectl create secret tls bridgekitty-tls \
+#   --cert=path/to/tls.crt \
+#   --key=path/to/tls.key \
+#   -n <namespace>

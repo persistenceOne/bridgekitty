@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bridgekitty-config
+  labels:
+    app: bridgekitty-backend
+data:
+  PORT: "3000"
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  QUOTE_RATE_LIMIT: "30"
+  EXECUTE_RATE_LIMIT: "10"
+  QUOTE_TTL_SECONDS: "300"
+  # Fee percentages (override in secrets for production values)
+  LIFI_FEE_PERCENT: "0.5"
+  DEBRIDGE_FEE_BPS: "50"
+  RELAY_FEE_BPS: "50"
+  ACROSS_FEE_BPS: "30"
+  SQUID_FEE_PERCENT: "0.5"

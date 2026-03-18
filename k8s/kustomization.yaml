@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bridgekitty
+
+resources:
+  - base/configmap.yaml
+  - base/secret.yaml
+  - base/deployment.yaml
+  - base/service.yaml
+  - base/ingress.yaml
+  - base/hpa.yaml
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: bridgekitty-backend
+  app.kubernetes.io/part-of: persistenceone
+  app.kubernetes.io/managed-by: kustomize
+
+# Image replacement for different environments
+# Uncomment and modify for staging/production overlays
+# images:
+#   - name: ghcr.io/persistenceone/bridgekitty-backend
+#     newTag: v1.0.0
