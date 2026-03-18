@@ -10,6 +10,7 @@ import { AcrossBackend } from "./backends/across.js";
 import { SquidBackend } from "./backends/squid.js";
 import { RoutingEngine } from "./routing/engine.js";
 import { CircuitBreaker } from "./utils/circuit-breaker.js";
+import { createProxyEngine } from "./proxy/index.js";
 import { registerGetQuote } from "./tools/get-quote.js";
 import { registerExecuteBridge } from "./tools/execute-bridge.js";
 import { registerCheckStatus } from "./tools/check-status.js";
@@ -144,7 +145,16 @@ async function main() {
     process.exit(0);
   }
 
-  const engine = createEngine();
+  // If BRIDGEKITTY_BACKEND_URL is set, proxy all bridge calls to the hosted backend.
+  // This keeps API keys and fee config server-side and enables telemetry/rate-limiting.
+  const backendUrl = process.env.BRIDGEKITTY_BACKEND_URL;
+  const engine = backendUrl
+    ? (createProxyEngine(backendUrl) as unknown as RoutingEngine)
+    : createEngine();
+
+  if (backendUrl) {
+    console.error(`[BridgeKitty] Proxy mode: routing via ${backendUrl}`);
+  }
 
   const server = new McpServer({
     name: "bridgekitty",
