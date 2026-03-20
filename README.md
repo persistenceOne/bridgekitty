@@ -4,12 +4,21 @@ Cross-chain bridge aggregator MCP server for AI agents. One server, 5 bridge bac
 
 BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, balance checks, and safety warnings.
 
-## What's New in v0.3.0
+**Latest npm release:** `@persistenceone/bridgekitty@0.3.5`
+
+## What's New in v0.3.5
+
+- Patch release — version alignment across npm package, MCP registry manifest (`server.json`), and docs.
+
+<details>
+<summary>What's New in v0.3.0</summary>
 
 - **`sign_and_send` parameter** — agents can now sign and broadcast transactions directly using locally-stored wallet keys
 - **Full EVM signing support** — works with all EVM backends (Across, Relay, LI.FI, Squid, deBridge) + Persistence Interop (EIP-712)
 - **Simulation fix** — ERC20 bridges now work on fresh wallets (previously blocked by premature simulation)
 - **Solana signing** — coming in next release
+
+</details>
 
 <details>
 <summary>What's New in v0.2.0</summary>
