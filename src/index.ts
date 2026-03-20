@@ -2,14 +2,8 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { LiFiBackend } from "./backends/lifi.js";
-import { PersistenceBackend } from "./backends/persistence.js";
-import { DeBridgeBackend } from "./backends/debridge.js";
-import { RelayBackend } from "./backends/relay.js";
-import { AcrossBackend } from "./backends/across.js";
-import { SquidBackend } from "./backends/squid.js";
 import { RoutingEngine } from "./routing/engine.js";
-import { CircuitBreaker } from "./utils/circuit-breaker.js";
+import { createProxyEngine } from "./proxy/index.js";
 import { registerGetQuote } from "./tools/get-quote.js";
 import { registerExecuteBridge } from "./tools/execute-bridge.js";
 import { registerCheckStatus } from "./tools/check-status.js";
@@ -75,45 +69,9 @@ try {
 } catch { /* non-fatal */ }
 
 // MEDIUM-002: Immediately move sensitive keys from process.env to in-memory store.
-// loadDotEnv puts everything into process.env; calling getKey() moves them to the
-// in-memory keyStore and deletes from process.env, minimizing the exposure window.
 getKey("privateKey");
 getKey("mnemonic");
 getKey("solanaKey");
-
-// ─── BridgeKitty fee configuration (hardcoded — not user-configurable) ────────
-// These are the BridgeKitty project's integrator/affiliate addresses.
-// Revenue from bridge fees funds ongoing development.
-// Persistence Interop routes are always fee-free (direct protocol integration).
-const BRIDGEKITTY_FEE_WALLET = "0xb24aCFcda187135490d81517ab56709FdDe6a81A";
-const BRIDGEKITTY_DEBRIDGE_FEE = undefined as string | undefined; // disabled for now
-const BRIDGEKITTY_LIFI_FEE = undefined as string | undefined; // needs portal.li.fi registration first
-const BRIDGEKITTY_LIFI_INTEGRATOR = undefined as string | undefined; // needs portal.li.fi registration first
-const BRIDGEKITTY_RELAY_FEE = undefined as string | undefined; // disabled for now
-
-function createEngine(): RoutingEngine {
-  const lifi = new LiFiBackend(
-    process.env.LIFI_API_KEY,
-    BRIDGEKITTY_LIFI_INTEGRATOR,
-    BRIDGEKITTY_LIFI_FEE
-  );
-  const persistence = new PersistenceBackend();
-  const debridge = new DeBridgeBackend(
-    BRIDGEKITTY_DEBRIDGE_FEE,
-    BRIDGEKITTY_FEE_WALLET
-  );
-  const relay = new RelayBackend(
-    BRIDGEKITTY_FEE_WALLET,
-    BRIDGEKITTY_RELAY_FEE
-  );
-  const across = new AcrossBackend(
-    BRIDGEKITTY_FEE_WALLET
-  );
-  const squid = new SquidBackend(process.env.SQUID_INTEGRATOR_ID);
-
-  const circuitBreaker = new CircuitBreaker();
-  return new RoutingEngine([lifi, persistence, debridge, relay, across, squid], circuitBreaker);
-}
 
 // Read version from package.json to avoid duplication
 const PKG_VERSION = (() => {
@@ -128,8 +86,6 @@ const PKG_VERSION = (() => {
 
 async function main() {
   // TTY detection: if run directly in a terminal (not piped), show help and exit.
-  // MCP servers communicate over stdio JSON-RPC — running in a TTY means the user
-  // probably ran `npx bridgekitty` directly instead of configuring it as an MCP server.
   if (process.stdin.isTTY && !process.argv.includes("--stdio")) {
     console.log(`BridgeKitty 🐱 v${PKG_VERSION} — Cross-chain bridge aggregator MCP server\n`);
     console.log("This is an MCP (Model Context Protocol) server. Add it to your AI tool's config:\n");
@@ -140,11 +96,24 @@ async function main() {
     console.log("  Direct (stdio):");
     console.log("    npx bridgekitty --stdio\n");
     console.log("Config: ~/.bridgekitty/.env (override with BRIDGEKITTY_HOME env var)");
+    console.log("  Required: BRIDGEKITTY_BACKEND_URL=https://your-backend-url");
     console.log("Docs:   https://github.com/persistenceOne/bridgekitty");
     process.exit(0);
   }
 
-  const engine = createEngine();
+  // All bridge calls are proxied to the hosted backend.
+  // API keys, fee config, and aggregator logic live server-side.
+  const backendUrl = process.env.BRIDGEKITTY_BACKEND_URL;
+  if (!backendUrl) {
+    console.error(
+      "❌ BRIDGEKITTY_BACKEND_URL is required. Set it in ~/.bridgekitty/.env or as an environment variable.\n" +
+      "   Example: BRIDGEKITTY_BACKEND_URL=https://bridgekitty.persistence.one"
+    );
+    process.exit(1);
+  }
+
+  const engine = createProxyEngine(backendUrl) as unknown as RoutingEngine;
+  console.error(`[BridgeKitty] Routing via ${backendUrl}`);
 
   const server = new McpServer({
     name: "bridgekitty",
@@ -170,7 +139,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // Sanitize fatal errors to avoid leaking keys/paths in crash output
   const msg = err instanceof Error ? err.message : String(err);
   const safeMsg = msg
     .replace(/\/[\w./-]+\.(ts|js|json|env)/g, "[path]")
