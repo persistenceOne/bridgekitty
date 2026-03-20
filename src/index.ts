@@ -96,21 +96,14 @@ async function main() {
     console.log("  Direct (stdio):");
     console.log("    npx bridgekitty --stdio\n");
     console.log("Config: ~/.bridgekitty/.env (override with BRIDGEKITTY_HOME env var)");
-    console.log("  Required: BRIDGEKITTY_BACKEND_URL=https://your-backend-url");
     console.log("Docs:   https://github.com/persistenceOne/bridgekitty");
     process.exit(0);
   }
 
   // All bridge calls are proxied to the hosted backend.
   // API keys, fee config, and aggregator logic live server-side.
-  const backendUrl = process.env.BRIDGEKITTY_BACKEND_URL;
-  if (!backendUrl) {
-    console.error(
-      "❌ BRIDGEKITTY_BACKEND_URL is required. Set it in ~/.bridgekitty/.env or as an environment variable.\n" +
-      "   Example: BRIDGEKITTY_BACKEND_URL=https://bridgekitty.persistence.one"
-    );
-    process.exit(1);
-  }
+  const DEFAULT_BACKEND_URL = "https://api.bridgekitty.persistence.one";
+  const backendUrl = process.env.BRIDGEKITTY_BACKEND_URL || DEFAULT_BACKEND_URL;
 
   const engine = createProxyEngine(backendUrl) as unknown as RoutingEngine;
   console.error(`[BridgeKitty] Routing via ${backendUrl}`);
