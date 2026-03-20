@@ -1,7 +1,7 @@
 {
   "name": "@persistenceone/bridgekitty",
-  "version": "0.3.2",
-  "description": "BridgeKitty \ud83d\udc31 \u2014 Cross-chain bridge aggregator MCP server for AI agents. One tool, all bridges, best routes.",
+  "version": "0.3.5",
+  "description": "BridgeKitty 🐱 — Cross-chain bridge aggregator MCP server for AI agents. One tool, all bridges, best routes.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -52,7 +52,6 @@
     "@cosmjs/proto-signing": "^0.38.1",
     "@cosmjs/stargate": "^0.38.1",
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "@persistenceone/bridgekitty": "^0.3.2",
     "@scure/bip39": "^2.0.1",
     "@solana/web3.js": "^1.98.0",
     "bs58": "^6.0.0",
