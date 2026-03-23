@@ -200,6 +200,60 @@ class ProxyBackend implements BridgeBackend {
 
     if (lastError) throw lastError as Error;
 
+    // Step 5: Submit order to Persistence backend so the solver picks it up.
+    // This mirrors PersistenceBackend.signAndExecute() Step 5.
+    const PERSISTENCE_API = "https://api.interop.persistence.one";
+    const orderHash = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["address", "address", "uint256", "uint32", "uint32", "uint32", "bytes"],
+        orderTuple,
+      ),
+    );
+    console.log(`[proxy/persistence] Order hash: ${orderHash}`);
+
+    const submitPayload = {
+      settlementContract: String(witness.settlementContract),
+      swapper: swapperAddress,
+      nonce: Number(witness.nonce),
+      originChainId: sourceChainId,
+      initiateDeadline: Number(witness.initiateDeadline),
+      fillDeadline: Number(witness.fillDeadline),
+      orderData: String(witness.orderData),
+      signature,
+      orderHash,
+      sourceChainTxHash: initiateTx.hash,
+    };
+
+    try {
+      const resp = await fetch(`${PERSISTENCE_API}/orders/submit-with-tx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(submitPayload),
+      });
+      if (!resp.ok) {
+        console.warn(`[proxy/persistence] Backend submission returned ${resp.status}: ${await resp.text()}`);
+      } else {
+        console.log("[proxy/persistence] Order submitted to backend.");
+      }
+    } catch (err) {
+      console.warn(`[proxy/persistence] Backend submission failed, retrying once: ${(err as Error).message}`);
+      try {
+        await new Promise((r) => setTimeout(r, 2_000));
+        const resp2 = await fetch(`${PERSISTENCE_API}/orders/submit-with-tx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(submitPayload),
+        });
+        if (!resp2.ok) {
+          console.warn(`[proxy/persistence] Retry submission returned ${resp2.status}`);
+        } else {
+          console.log("[proxy/persistence] Order submitted to backend (retry).");
+        }
+      } catch (retryErr) {
+        console.warn(`[proxy/persistence] Retry also failed: ${(retryErr as Error).message}`);
+      }
+    }
+
     const trackingId = txRequest.trackingId;
     const orderId = trackingId.replace("persistence:", "");
     return { txHash: initiateTx.hash, orderId, trackingId };
