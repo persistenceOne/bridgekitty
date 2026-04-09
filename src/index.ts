@@ -9,13 +9,10 @@ import { registerExecuteBridge } from "./tools/execute-bridge.js";
 import { registerCheckStatus } from "./tools/check-status.js";
 import { registerGetChains } from "./tools/get-chains.js";
 import { registerGetTokens } from "./tools/get-tokens.js";
-import { registerXprtFarmTools } from "./tools/xprt-farm.js";
 import { registerWalletTools, getKey, getConfigDir } from "./tools/wallet.js";
 import { registerHelpTool } from "./tools/help.js";
-import { registerXprtRewardsCheck } from "./tools/xprt-rewards.js";
 import { registerMultiQuote } from "./tools/multi-quote.js";
 import { registerOnboardTool } from "./tools/onboard.js";
-import { registerXprtStakingTools } from "./tools/xprt-staking.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -119,10 +116,7 @@ async function main() {
   registerGetChains(server, engine);
   registerGetTokens(server, engine);
   registerWalletTools(server);
-  registerXprtFarmTools(server, engine);
-  registerXprtStakingTools(server);
   registerHelpTool(server);
-  registerXprtRewardsCheck(server);
   registerMultiQuote(server, engine);
   registerOnboardTool(server, engine);
 
