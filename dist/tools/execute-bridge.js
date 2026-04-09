@@ -150,11 +150,18 @@ export function registerExecuteBridge(server, engine) {
                         isError: true,
                     };
                 }
-                // Persistence Interop (EIP-712): use signAndExecute directly
+                // Persistence Interop (EIP-712): use signAndExecute directly.
+                // Works for both PersistenceBackend (direct mode) and ProxyBackend (proxy mode).
                 if (quote.backendName === "persistence") {
-                    const persistenceBackend = backend;
+                    const signable = backend;
+                    if (typeof signable.signAndExecute !== "function") {
+                        return {
+                            content: [{ type: "text", text: "sign_and_send is not supported for this backend configuration. Run bridge_execute without sign_and_send to get unsigned transaction data." }],
+                            isError: true,
+                        };
+                    }
                     const signer = new ethers.Wallet(privateKey);
-                    const result = await persistenceBackend.signAndExecute(quote, signer);
+                    const result = await signable.signAndExecute(quote, signer);
                     return {
                         content: [{
                                 type: "text",
