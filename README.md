@@ -4,11 +4,13 @@ Cross-chain bridge aggregator MCP server for AI agents. One server, 5 bridge bac
 
 BridgeKitty gives AI agents (Claude, Cursor, GPT, or any MCP-compatible AI) the ability to find and execute cross-chain bridge transfers — with automatic route optimization, fee comparison, balance checks, and safety warnings.
 
-**Latest npm release:** `@persistenceone/bridgekitty@0.3.5`
+**Latest npm release:** `@persistenceone/bridgekitty@0.3.9`
 
-## What's New in v0.3.5
+## What's New in v0.3.9
 
-- Patch release — version alignment across npm package, MCP registry manifest (`server.json`), and docs.
+- **XPRT tools extracted** — staking, rewards, and farming tools moved to the standalone `xprt-farming-toolkit` package
+- **Persistence Interop backend removed** — BridgeKitty is now a focused bridge aggregator across 5 backends (deBridge, Relay, LI.FI, Across, Squid)
+- **Slimmer surface area** — fewer tools, clearer scope for agents
 
 <details>
 <summary>What's New in v0.3.0</summary>
@@ -129,8 +131,6 @@ Set `sign_and_send: true` to enable autonomous signing — BridgeKitty will use 
 4. **Sign** — signs the transaction with the local private key
 5. **Broadcast** — submits to the chain and returns the tx hash + explorer link
 
-**Persistence Interop** uses EIP-712 typed data signing (Permit2 approval + on-chain initiate) instead of standard approve-and-send.
-
 ### Optional API Keys
 
 | Variable | Description |
@@ -151,24 +151,24 @@ Set `sign_and_send: true` to enable autonomous signing — BridgeKitty will use 
 | `bridge_chains` | List supported chains with provider coverage. |
 | `bridge_tokens` | Search tokens on a chain. |
 
+### Multi-hop & Discovery
+
+| Tool | Description |
+|------|-------------|
+| `bridge_quote_multi` | Multi-hop route resolution when no direct route exists. |
+| `bridgekitty_help` | Agent onboarding guide with examples and tool usage. |
+| `xprt_onboard` | Guided onboarding flow for first-time users. |
+
 ### Wallet Tools
 
 | Tool | Description |
 |------|-------------|
 | `wallet_setup` | Create wallets for EVM, Cosmos, Solana from a single mnemonic. |
+| `wallet_import` | Import an existing wallet from a mnemonic or private key. |
+| `wallet_status` | Show configured wallet addresses and key source. |
 | `wallet_balance` | Check balances across all chains with USD prices (CoinGecko). |
 
-### XPRT Staking & Farming
-
-| Tool | Description |
-|------|-------------|
-| `xprt_stake` | Stake XPRT to a validator (warns about 21-day unbonding). |
-| `xprt_unstake` | Unstake XPRT (21-day unbonding period). |
-| `xprt_claim_rewards` | Claim staking rewards. |
-| `xprt_rewards_check` | Check farming rewards, multiplier tier, epoch status. |
-| `xprt_farm_start` | Start automated BTC round-trip farming (cbBTC ↔ BTCB). |
-| `xprt_farm_boost` | Buy + stake XPRT for multiplier boost (1x → 3x → 5x). |
-| `bridgekitty_help` | Full docs on farming tiers, multipliers, and strategy. |
+> **XPRT staking & farming** has moved to the standalone [`xprt-farming-toolkit`](https://www.npmjs.com/package/xprt-farming-toolkit) package.
 
 ## Example: Bridge USDC from Base to Arbitrum
 
