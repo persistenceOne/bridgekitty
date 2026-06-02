@@ -5,6 +5,10 @@
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+// Source-channel attribution — tags every backend call as coming from the npm
+// package so the analytics dashboards can break interactions down by channel.
+const SOURCE_HEADERS = { "x-bk-source": "npm" } as const;
+
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
@@ -31,7 +35,7 @@ export class BackendClient {
   async quote(body: unknown): Promise<unknown> {
     return fetchJson(`${this.baseUrl}/api/v1/quote`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...SOURCE_HEADERS },
       body: JSON.stringify(body),
     });
   }
@@ -39,7 +43,7 @@ export class BackendClient {
   async execute(body: unknown): Promise<unknown> {
     return fetchJson(`${this.baseUrl}/api/v1/execute`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...SOURCE_HEADERS },
       body: JSON.stringify(body),
     });
   }
@@ -47,18 +51,22 @@ export class BackendClient {
   async status(trackingId: string, meta?: Record<string, string>): Promise<unknown> {
     const params = new URLSearchParams(meta);
     const qs = params.toString() ? `?${params.toString()}` : "";
-    return fetchJson(`${this.baseUrl}/api/v1/status/${encodeURIComponent(trackingId)}${qs}`);
+    return fetchJson(`${this.baseUrl}/api/v1/status/${encodeURIComponent(trackingId)}${qs}`, {
+      headers: { ...SOURCE_HEADERS },
+    });
   }
 
   async chains(): Promise<unknown> {
-    return fetchJson(`${this.baseUrl}/api/v1/chains`);
+    return fetchJson(`${this.baseUrl}/api/v1/chains`, { headers: { ...SOURCE_HEADERS } });
   }
 
   async tokens(chainId: number): Promise<unknown> {
-    return fetchJson(`${this.baseUrl}/api/v1/tokens?chainId=${chainId}`);
+    return fetchJson(`${this.baseUrl}/api/v1/tokens?chainId=${chainId}`, {
+      headers: { ...SOURCE_HEADERS },
+    });
   }
 
   async health(): Promise<unknown> {
-    return fetchJson(`${this.baseUrl}/api/v1/health`);
+    return fetchJson(`${this.baseUrl}/api/v1/health`, { headers: { ...SOURCE_HEADERS } });
   }
 }
