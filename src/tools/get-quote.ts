@@ -289,9 +289,25 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
         throw err;
       }
 
+      // Stamp human-readable swap context on each cached quote so bridge_execute
+      // can report a completed swap to the backend for analytics (source=npm)
+      // without having to reverse-map backend-specific quoteData.
+      const swapContext = {
+        fromChain: getChainName(fromChainId),
+        toChain: getChainName(toChainId),
+        fromTokenSymbol: fromSymbol,
+        toTokenSymbol: toSymbol,
+        amount: amountTrimmed,
+        fromAddress: params.fromAddress,
+      };
+      for (const q of quotes) {
+        (q as typeof q & { swapContext?: typeof swapContext }).swapContext = swapContext;
+      }
+
       if (quotes.length === 0) {
         // Differentiate "route doesn't exist" from "backends are down"
         const diagnosis = engine.getLastRequestDiagnosis();
+        const failedProviders = engine.getLastFailedProviders();
         let message: string;
         if (diagnosis.allErrored) {
           message = `All bridge providers are currently unavailable. Please try again in a few minutes.`;
@@ -300,6 +316,12 @@ export function registerGetQuote(server: McpServer, engine: RoutingEngine) {
           }
         } else {
           message = `No bridge routes found for ${params.amount} ${fromSymbol} from ${getChainName(fromChainId)} to ${getChainName(toChainId)}. This route may not be supported by any provider.`;
+        }
+        // Surface per-provider failure reasons so callers can diagnose without
+        // having to enable verbose logging on the hosted backend.
+        if (failedProviders.length > 0) {
+          const lines = failedProviders.map((f) => `  - ${f.provider}: ${f.reason}`);
+          message += `\n\nProvider details:\n${lines.join("\n")}`;
         }
         return {
           content: [

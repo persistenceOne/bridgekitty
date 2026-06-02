@@ -7,6 +7,20 @@ import { getAllChains, isCosmosChain, isSolanaChain } from "../utils/chains.js";
 
 export interface CachedQuote extends BridgeQuote {
   quoteId: string;
+  /**
+   * Human-readable swap context captured at quote time (chains, token symbols,
+   * amount, sender). Used by bridge_execute to report completed swaps to the
+   * hosted backend for analytics attribution (source=npm). Optional — absent
+   * on quotes built outside the bridge_get_quote tool.
+   */
+  swapContext?: {
+    fromChain: string;
+    toChain: string;
+    fromTokenSymbol: string;
+    toTokenSymbol: string;
+    amount: string;
+    fromAddress: string;
+  };
 }
 
 /** Minimum buffer (ms) before a quote's expiry — quotes expiring within this window are filtered out. */

@@ -7,6 +7,36 @@ import { getChainName, isSolanaChain } from "../utils/chains.js";
 import { sanitizeError } from "../utils/sanitize-error.js";
 import { getKey } from "./wallet.js";
 import { getProvider } from "../utils/gas-estimator.js";
+import { reportSwap } from "../utils/report-swap.js";
+
+/**
+ * Report a completed (signed + broadcast) swap to the backend for analytics
+ * attribution (source=npm). Only fires when the quote carries swapContext
+ * (set by bridge_get_quote). Best-effort — never throws.
+ */
+function reportNpmSwap(
+  quote: { quoteId?: string; provider?: string; swapContext?: {
+    fromChain: string; toChain: string; fromTokenSymbol: string;
+    toTokenSymbol: string; amount: string; fromAddress: string;
+  } },
+  txHash: string,
+  userAddress: string,
+): void {
+  const ctx = quote.swapContext;
+  if (!ctx || !quote.quoteId) return;
+  reportSwap({
+    userAddress,
+    txHash,
+    quoteId: quote.quoteId,
+    provider: quote.provider,
+    fromChain: ctx.fromChain,
+    toChain: ctx.toChain,
+    fromTokenSymbol: ctx.fromTokenSymbol,
+    toTokenSymbol: ctx.toTokenSymbol,
+    amount: ctx.amount,
+    status: "submitted",
+  });
+}
 
 // H-3: Quote execution locking — prevent double-execution
 const executingQuotes = new Set<string>();
@@ -185,6 +215,7 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
             }
             const signer = new ethers.Wallet(privateKey);
             const result = await signable.signAndExecute(quote, signer);
+            reportNpmSwap(quote, result.txHash, signer.address);
             return {
               content: [{
                 type: "text" as const,
@@ -307,6 +338,8 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
             ...(sim.estimatedGas ? { gasLimit: sim.estimatedGas } : {}),
           });
           const receipt = await txResponse.wait();
+
+          reportNpmSwap(quote, txResponse.hash, connectedSigner.address);
 
           return {
             content: [{
