@@ -9,22 +9,44 @@ import { getKey } from "./wallet.js";
 import { getProvider } from "../utils/gas-estimator.js";
 import { reportSwap } from "../utils/report-swap.js";
 
-/**
- * Report a completed (signed + broadcast) swap to the backend for analytics
- * attribution (source=npm). Only fires when the quote carries swapContext
- * (set by bridge_get_quote). Best-effort — never throws.
- */
-function reportNpmSwap(
-  quote: { quoteId?: string; provider?: string; swapContext?: {
+/** Background poll interval / overall timeout for advancing a reported swap
+ *  from "submitted" to a terminal status. */
+const TERMINAL_POLL_INTERVAL_MS = 15_000;
+const TERMINAL_POLL_TIMEOUT_MS = 20 * 60_000;
+
+type NpmSwapQuote = {
+  quoteId?: string;
+  provider?: string;
+  backendName?: string;
+  swapContext?: {
     fromChain: string; toChain: string; fromTokenSymbol: string;
     toTokenSymbol: string; amount: string; fromAddress: string;
-  } },
+  };
+};
+
+/**
+ * Report a signed + broadcast swap to the backend for analytics attribution
+ * (source=npm). Only fires when the quote carries swapContext (set by
+ * bridge_get_quote). Best-effort — never throws.
+ *
+ * Reports "submitted" immediately, then polls bridge status in the background
+ * and re-reports the terminal status (completed/failed) so the swap advances
+ * past "submitted" on the analytics status funnel. The MCP server is a
+ * long-lived process, so the poll outlives this tool response; if the process
+ * exits or the bridge never settles within the timeout, the swap simply stays
+ * "submitted".
+ */
+function reportNpmSwap(
+  engine: RoutingEngine,
+  quote: NpmSwapQuote,
   txHash: string,
+  trackingId: string | undefined,
   userAddress: string,
 ): void {
   const ctx = quote.swapContext;
   if (!ctx || !quote.quoteId) return;
-  reportSwap({
+
+  const base = {
     userAddress,
     txHash,
     quoteId: quote.quoteId,
@@ -34,8 +56,30 @@ function reportNpmSwap(
     fromTokenSymbol: ctx.fromTokenSymbol,
     toTokenSymbol: ctx.toTokenSymbol,
     amount: ctx.amount,
-    status: "submitted",
-  });
+  };
+
+  reportSwap({ ...base, status: "submitted" });
+
+  if (!trackingId) return;
+  const providerName = quote.backendName || trackingId.split(":")[0] || "lifi";
+  const backend = engine.getBackend(providerName);
+  if (!backend) return;
+
+  const deadline = Date.now() + TERMINAL_POLL_TIMEOUT_MS;
+  void (async () => {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, TERMINAL_POLL_INTERVAL_MS));
+      try {
+        const { state } = await backend.getStatus(trackingId, { txHash });
+        if (state === "completed" || state === "failed" || state === "refunded") {
+          reportSwap({ ...base, status: state === "completed" ? "completed" : "failed" });
+          return;
+        }
+      } catch {
+        // Transient status-check failure — keep polling until the deadline.
+      }
+    }
+  })();
 }
 
 // H-3: Quote execution locking — prevent double-execution
@@ -215,7 +259,7 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
             }
             const signer = new ethers.Wallet(privateKey);
             const result = await signable.signAndExecute(quote, signer);
-            reportNpmSwap(quote, result.txHash, signer.address);
+            reportNpmSwap(engine, quote, result.txHash, result.trackingId, signer.address);
             return {
               content: [{
                 type: "text" as const,
@@ -339,7 +383,7 @@ export function registerExecuteBridge(server: McpServer, engine: RoutingEngine) 
           });
           const receipt = await txResponse.wait();
 
-          reportNpmSwap(quote, txResponse.hash, connectedSigner.address);
+          reportNpmSwap(engine, quote, txResponse.hash, txRequest.trackingId, connectedSigner.address);
 
           return {
             content: [{
